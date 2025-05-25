@@ -1,0 +1,3 @@
+# ComfyUI Deadline Plugin Requirements
+# This plugin primarily uses standard Python libraries
+# No additional dependencies required beyond ComfyUI itself 
