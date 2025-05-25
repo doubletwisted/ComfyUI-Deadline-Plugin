@@ -5,7 +5,7 @@ A comprehensive plugin for integrating ComfyUI workflows with Thinkbox Deadline 
 """
 
 # Import the custom nodes
-from .custom_nodes.deadline_submission import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .deadline_submit import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 # Export for ComfyUI Manager
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"] 
