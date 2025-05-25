@@ -16,16 +16,15 @@ This repository contains two main components:
 
 ```
 ComfyUI-Deadline-Plugin/
-├── custom_nodes/deadline_submission/    # ComfyUI custom nodes (auto-installed)
-│   ├── __init__.py
-│   ├── deadline_submit.py
-│   └── README.md
+├── deadline_submit.py                   # Main ComfyUI custom node
+├── __init__.py                          # Node exports for ComfyUI
 ├── plugins/ComfyUI/                     # Deadline plugin (manual install required)
 │   ├── ComfyUI.py
-│   ├── ComfyUI.param
-│   └── README.md
+│   └── ComfyUI.param
+├── example_extra_model_paths.yaml       # Example model paths configuration
 ├── requirements.txt                     # Python dependencies
 ├── pyproject.toml                      # Modern Python packaging
+├── LICENSE                             # MIT License
 └── README.md                           # This file
 ```
 
