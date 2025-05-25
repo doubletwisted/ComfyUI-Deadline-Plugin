@@ -1,0 +1,33 @@
+[About]
+Type=label
+Label=About
+Category=About Plugin
+CategoryOrder=-1
+Index=0
+Default=ComfyUI plugin for Deadline. Renders a workflow.json file using ComfyUI portable.
+Description=Not configurable
+
+[ConcurrentTasks]
+Type=label
+Label=ConcurrentTasks
+Category=About Plugin
+CategoryOrder=-1
+Index=0
+Default=True
+Description=Not configurable
+
+[ComfyUIPath]
+Type=filename
+Label=ComfyUI Installation Path
+Category=Configuration
+Index=0
+Default=C:\\ComfyUI_windows_portable
+Description=Path to your ComfyUI portable installation directory. The plugin will automatically find main.py and the embedded Python executable.
+
+[DefaultOutputDirectory]
+Type=filename
+Label=Default Output Directory (Optional)
+Category=Configuration
+Index=1
+Default=
+Description=Optional default output directory. If blank, uses ComfyUI's default output folder. This can be overridden per job. 

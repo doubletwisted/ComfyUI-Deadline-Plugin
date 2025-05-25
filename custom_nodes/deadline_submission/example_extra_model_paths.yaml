@@ -1,0 +1,130 @@
+#Rename this to extra_model_paths.yaml and ComfyUI will load it
+
+#config for comfyui with local-first, network-fallback setup
+#Local path: C:/AI (fast access)
+#Network path: X:/AI (centralized storage, fallback)
+
+comfyui:
+     # Network base path - centralized storage location
+     base_path: X:/AI
+     # You can use is_default to mark that these folders should be listed first, and used as the default dirs for eg downloads
+     is_default: true
+     
+     # Network path first, local path second (results in local-first behavior)
+     checkpoints: |
+          models/checkpoints
+          C:/AI/models/checkpoints
+     
+     clip: |
+          models/clip
+          C:/AI/models/clip
+     
+     clip_vision: |
+          models/clip_vision
+          C:/AI/models/clip_vision
+     
+     configs: |
+          models/configs
+          C:/AI/models/configs
+     
+     controlnet: |
+          models/controlnet
+          C:/AI/models/controlnet
+     
+     diffusion_models: |
+          models/diffusion_models
+          models/unet
+          C:/AI/models/diffusion_models
+          C:/AI/models/unet
+     
+     embeddings: |
+          models/embeddings
+          C:/AI/models/embeddings
+     
+     loras: |
+          models/loras
+          C:/AI/models/loras
+     
+     upscale_models: |
+          models/upscale_models
+          C:/AI/models/upscale_models
+     
+     vae: |
+          models/vae
+          C:/AI/models/vae
+     
+     style_models: |
+          models/style_models
+          C:/AI/models/style_models
+     
+     depthanything: |
+          models/depthanything
+          C:/AI/models/depthanything
+     
+     annotators: |
+          models/annotators
+          C:/AI/models/annotators
+     
+     depth: |
+          models/depth
+          C:/AI/models/depth
+     
+     depthcrafter: |
+          models/depthcrafter
+          C:/AI/models/depthcrafter
+     
+     diffusers: |
+          models/diffusers
+          C:/AI/models/diffusers
+     
+     gligen: |
+          models/gligen
+          C:/AI/models/gligen
+     
+     grounding-dino: |
+          models/grounding-dino
+          C:/AI/models/grounding-dino
+     
+     hypernetworks: |
+          models/hypernetworks
+          C:/AI/models/hypernetworks
+     
+     ipadapter: |
+          models/ipadapter
+          C:/AI/models/ipadapter
+     
+     llm_gguf: |
+          models/llm_gguf
+          C:/AI/models/llm_gguf
+     
+     photomaker: |
+          models/photomaker
+          C:/AI/models/photomaker
+     
+     sam: |
+          models/sam
+          C:/AI/models/sam
+     
+     sam2: |
+          models/sam2
+          C:/AI/models/sam2
+     
+     sams: |
+          models/sams
+          C:/AI/models/sams
+     
+     text_encoders: |
+          models/text_encoders
+          C:/AI/models/text_encoders
+     
+     ultralytics: |
+          models/ultralytics
+          C:/AI/models/ultralytics
+     
+     unet: |
+          models/unet
+          C:/AI/models/unet
+     
+     vae_approx: |
+          models/vae_approx
+          C:/AI/models/vae_approx
