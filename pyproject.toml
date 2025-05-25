@@ -27,15 +27,15 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/ComfyUI-Deadline-Plugin"
-Repository = "https://github.com/YOUR_USERNAME/ComfyUI-Deadline-Plugin"
-Issues = "https://github.com/YOUR_USERNAME/ComfyUI-Deadline-Plugin/issues"
+Homepage = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin"
+Repository = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin"
+Issues = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["custom_nodes*"]
 
 [comfyui]
-PublisherId = "YOUR_USERNAME"
+PublisherId = "doubletwisted"
 DisplayName = "ComfyUI Deadline Submission"
 Icon = "" 
