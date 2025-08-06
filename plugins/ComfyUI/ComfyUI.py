@@ -520,6 +520,9 @@ print('Dummy command timeout reached or task completed.')
         if platform.system().lower() == 'windows':
             args_list.append("--windows-standalone-build")
 
+
+        args_list.append("--disable-auto-launch")
+
         # Add output directory if custom one was specified
         if self.custom_output_dir_specified and self.comfyui_output_dir:
             args_list.append(f'--output-directory "{self.comfyui_output_dir}"')
