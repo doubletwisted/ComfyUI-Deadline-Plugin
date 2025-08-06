@@ -354,11 +354,8 @@ class DeadlineJobSubmitter:
             
             f.write("DefaultCudaDeviceZero=True\n")
             
-            # Map boolean to appropriate SeedMode value
-            if config.get('change_seeds_per_task', True):
-                f.write("SeedMode=change\n")
-            else:
-                f.write("SeedMode=fixed\n")
+            # Note: Seed handling is now managed by DeadlineSeed nodes
+            f.write("SeedMode=fixed\n")
             
             if config['batch_count'] > 1:
                 f.write("BatchMode=True\n")
@@ -427,6 +424,60 @@ class ExecutionInterruptor:
             
         return True
 
+class DeadlineSeed:
+    """
+    Distributes seed values across Deadline tasks.
+    On first task: passes through the original seed.
+    On subsequent tasks: adds offset based on task ID.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seed": ("INT", {
+                    "default": 1125899906842, 
+                    "min": 0,
+                    "max": 1125899906842624,
+                    "forceInput": False  # Widget by default, can be converted to input
+                }),
+            },
+            "hidden": {
+                "task_id": ("INT", {"default": 0}),
+                "batch_mode": ("BOOLEAN", {"default": False}),
+            },
+        }
+    
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("seed",)
+    FUNCTION = "distribute"
+    CATEGORY = "deadline"
+    
+    def distribute(self, seed, task_id=0, batch_mode=False):
+        """
+        Distribute seeds across Deadline tasks.
+        
+        Args:
+            seed: Base seed value
+            task_id: Current task ID (injected by Deadline)
+            batch_mode: Whether this is running in batch mode
+        """
+        # Ensure task_id is an integer
+        try:
+            task_id = int(task_id)
+        except (ValueError, TypeError):
+            task_id = 0
+            
+        if not batch_mode or task_id == 0:
+            # First task or not in batch mode: pass through original seed
+            print(f"Deadline Seed: Task {task_id} using original seed {seed}")
+            return (seed,)
+        else:
+            # Subsequent tasks: add offset based on task ID
+            new_seed = seed + task_id
+            print(f"Deadline Seed: Task {task_id} using modified seed {new_seed} (original: {seed})")
+            return (new_seed,)
+
 # Node implementation
 class DeadlineSubmitNode:
     """Submit the current ComfyUI workflow to Thinkbox Deadline"""
@@ -460,11 +511,7 @@ class DeadlineSubmitNode:
                     "max": NodeDefaults.MAX_CHUNK_SIZE, 
                     "step": 1
                 }),
-                "change_seeds_per_task": ("BOOLEAN", {
-                    "default": True, 
-                    "label_on": "Vary seeds across tasks", 
-                    "label_off": "Keep original seeds"
-                }),
+
                 "priority": ("INT", {
                     "default": NodeDefaults.PRIORITY, 
                     "min": 0, 
@@ -488,6 +535,7 @@ class DeadlineSubmitNode:
                 }),
                 "comment": ("STRING", {"default": ""}),
                 "department": ("STRING", {"default": ""}),
+
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -529,7 +577,7 @@ class DeadlineSubmitNode:
             return [NodeDefaults.GROUP]
 
     def submit_to_deadline(self, workflow_file, auto_detect_workflow, batch_count, chunk_size, 
-                         change_seeds_per_task, priority, pool, group, job_name, bypass, 
+                         priority, pool, group, job_name, bypass, 
                          skip_local_execution=True, output_directory="", comment="", department="", 
                          prompt=None, extra_pnginfo=None):
         """Submit the workflow to Deadline for rendering"""
@@ -549,7 +597,7 @@ class DeadlineSubmitNode:
             # Create job configuration
             job_config = self._create_job_config(
                 job_name, priority, pool, group, batch_count, chunk_size,
-                change_seeds_per_task, output_directory, comment, department
+                output_directory, comment, department
             )
             
             # Submit to Deadline
@@ -591,7 +639,7 @@ class DeadlineSubmitNode:
                 raise Exception(f"Could not read workflow file: {str(e)}")
 
     def _create_job_config(self, job_name: str, priority: int, pool: str, group: str, 
-                          batch_count: int, chunk_size: int, change_seeds_per_task: bool,
+                          batch_count: int, chunk_size: int,
                           output_directory: str, comment: str, department: str) -> Dict:
         """Create job configuration dictionary"""
         return {
@@ -601,7 +649,6 @@ class DeadlineSubmitNode:
             'group': group,
             'batch_count': batch_count,
             'chunk_size': chunk_size,
-            'change_seeds_per_task': change_seeds_per_task,
             'output_directory': output_directory,
             'comment': comment,
             'department': department
@@ -610,9 +657,11 @@ class DeadlineSubmitNode:
 # Register the nodes
 NODE_CLASS_MAPPINGS = {
     "DeadlineSubmit": DeadlineSubmitNode,
+    "DeadlineSeed": DeadlineSeed,
 }
 
 # Add display names for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DeadlineSubmit": "Submit to Deadline",
+    "DeadlineSeed": "Deadline Seed",
 } 

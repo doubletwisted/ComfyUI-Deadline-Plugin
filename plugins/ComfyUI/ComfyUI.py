@@ -14,6 +14,8 @@ import urllib.error
 import urllib.parse
 import traceback
 import random
+import platform
+from typing import Tuple
 
 """
 ComfyUI Deadline Plugin
@@ -39,6 +41,27 @@ SEED_PARAMETER_NAMES = ["seed", "noise_seed", "value"]
 
 # Output node types that indicate the workflow will produce output
 OUTPUT_NODE_TYPES = ["SaveImage", "PreviewImage", "SaveVideo"]
+
+def get_distributed_config_for_plugin(plugin) -> Tuple[bool, bool, bool]:
+    """Get distributed configuration with plugin info priority, fallback to environment"""
+    # Priority 1: Plugin info entries (preferred)
+    worker_mode = plugin.GetBooleanPluginInfoEntryWithDefault("WorkerMode", False)
+    distributed_mode = plugin.GetBooleanPluginInfoEntryWithDefault("DistributedMode", False) 
+    force_new_instance = plugin.GetBooleanPluginInfoEntryWithDefault("ForceNewInstance", False)
+    
+    # Priority 2: Environment variables (fallback for backwards compatibility)
+    if not worker_mode and not distributed_mode and not force_new_instance:
+        worker_mode = os.environ.get('COMFY_WORKER_MODE', '0').lower() in ('1', 'true', 'yes')
+        distributed_mode = os.environ.get('DEADLINE_DIST_MODE', '0').lower() in ('1', 'true', 'yes')
+        force_new_instance = os.environ.get('COMFY_FORCE_NEW_INSTANCE', '0').lower() in ('1', 'true', 'yes')
+        
+        if worker_mode or distributed_mode or force_new_instance:
+            plugin.LogWarning("Using environment variables for distributed config. Consider updating to plugin info entries.")
+    
+    # Log the configuration
+    plugin.LogInfo(f"Distributed config - WorkerMode: {worker_mode}, DistributedMode: {distributed_mode}, ForceNewInstance: {force_new_instance}")
+    
+    return worker_mode, distributed_mode, force_new_instance
 
 def GetDeadlinePlugin():
     return ComfyUI()
@@ -71,6 +94,8 @@ class ComfyUI(DeadlinePlugin):
         """Setup stdout handlers for ComfyUI output parsing"""
         # Server startup handlers
         self.AddStdoutHandlerCallback(".*Starting server.*").HandleCallback += self.HandleServerStarted
+        # Also catch the GUI message as backup
+        self.AddStdoutHandlerCallback(".*To see the GUI go to.*").HandleCallback += self.HandleServerStarted
         self.AddStdoutHandlerCallback(".*Error:.*").HandleCallback += self.HandleStdoutError
         self.AddStdoutHandlerCallback(".*Exception:.*").HandleCallback += self.HandleStdoutError
 
@@ -265,6 +290,26 @@ class ComfyUI(DeadlinePlugin):
 
     def _determine_final_port(self, base_port: int) -> str:
         """Determine final port to use, checking for existing instances"""
+        # Check if we should force a new instance (for distributed workers)
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        
+        if force_new_instance or worker_mode or distributed_mode:
+            self.LogInfo("Worker/Distributed mode: Will start new ComfyUI instance (not reusing existing)")
+            self.use_existing_comfyui = False
+            
+            # For workers, use dynamic port allocation to avoid conflicts
+            if worker_mode or distributed_mode:
+                worker_port = self._calculate_worker_port(base_port)
+                self.comfyui_port = self._find_available_port(worker_port)
+                self.LogInfo(f"Worker mode: Using port {self.comfyui_port}")
+            else:
+                self.comfyui_port = self._find_available_port(base_port)
+                self.LogInfo(f"Force new instance: Using port {self.comfyui_port}")
+                
+            self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+            return self.comfyui_port
+        
+        # Normal batch mode logic
         self.LogInfo(f"Checking if ComfyUI is already running on port {base_port}")
         
         if self._is_port_in_use(base_port):
@@ -281,6 +326,25 @@ class ComfyUI(DeadlinePlugin):
             self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
         
         return self.comfyui_port
+
+    def _calculate_worker_port(self, base_port: int) -> int:
+        """Calculate unique worker port based on task ID to avoid conflicts"""
+        try:
+            # Get task ID from Deadline environment
+            task_id = int(os.environ.get('DEADLINE_TASK_ID', '1'))
+            
+            # Calculate unique worker port: base_port + 100 + task_id
+            # This ensures workers get ports like 8289, 8290, 8291, etc.
+            # For single PC testing, this allows multiple workers on one GPU
+            worker_port = base_port + 100 + task_id
+            
+            self.LogInfo(f"Calculated worker port: {worker_port} (base: {base_port}, task: {task_id})")
+            return worker_port
+        except ValueError:
+            # Fallback if task ID is not a valid integer
+            fallback_port = base_port + 100
+            self.LogInfo(f"Could not parse task ID, using fallback port: {fallback_port}")
+            return fallback_port
 
     def PreRenderTasks(self):
         """Setup tasks before rendering"""
@@ -441,6 +505,18 @@ print('Dummy command timeout reached or task completed.')
         cuda_arg = self._get_cuda_device_arg()
         if cuda_arg:
             args_list.append(cuda_arg)
+        
+        # Add ComfyUI flags for worker mode
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        
+        if worker_mode or distributed_mode:
+            args_list.append("--listen")  # Allow external connections
+            args_list.append("--enable-cors-header")  # Enable CORS for API access
+            ##args_list.append("--dont-print-server")  # Reduce startup output for workers
+            
+        # Always add windows standalone build flag if on Windows
+        if platform.system().lower() == 'windows':
+            args_list.append("--windows-standalone-build")
 
         # Add output directory if custom one was specified
         if self.custom_output_dir_specified and self.comfyui_output_dir:
@@ -455,14 +531,30 @@ print('Dummy command timeout reached or task completed.')
 
     def HandleServerStarted(self):
         """Called when the ComfyUI server has started"""
+        # Prevent multiple triggers from stdout handlers
+        if self.workflow_submitted:
+            self.LogInfo("ComfyUI server startup detected, but workflow already submitted - ignoring")
+            return
+            
         self.LogInfo("ComfyUI server has started")
         self.server_started = True
         
+        # Check if we're in worker/distributed mode
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        
+        self.LogInfo(f"Distributed config check - WorkerMode: {worker_mode}, DistributedMode: {distributed_mode}")
+        self.LogInfo(f"use_existing_comfyui={self.use_existing_comfyui}, workflow_submitted={self.workflow_submitted}")
+        
         # Start workflow submission if not using existing instance
         if not self.use_existing_comfyui and not self.workflow_submitted:
+            # Mark as submitted IMMEDIATELY to prevent race conditions
+            self.workflow_submitted = True
+            self.LogInfo("Starting workflow submission thread...")
             workflow_thread = threading.Thread(target=self.submit_workflow)
             workflow_thread.daemon = True
             workflow_thread.start()
+        else:
+            self.LogInfo("Skipping workflow submission - using existing instance or already submitted")
 
     def http_request(self, url: str, method: str = "GET", data=None, headers=None, verbose: bool = True) -> dict:
         """Make an HTTP request to the ComfyUI API"""
@@ -578,6 +670,42 @@ print('Dummy command timeout reached or task completed.')
         else:
             return random.randint(0, MAX_SEED_VALUE)
 
+    def inject_deadline_seed_parameters(self, workflow_data: dict) -> bool:
+        """
+        Inject task_id and batch_mode into DeadlineDistributedSeed nodes.
+        
+        Args:
+            workflow_data: The workflow data
+            
+        Returns:
+            bool: True if any nodes were modified, False otherwise
+        """
+        try:
+            task_id = int(self.GetCurrentTaskId())
+            batch_mode = self.batch_mode
+            nodes_modified = False
+            
+            for node_id, node in workflow_data.items():
+                if not isinstance(node, dict):
+                    continue
+                    
+                if node.get("class_type") == "DeadlineSeed":
+                    if "inputs" not in node:
+                        node["inputs"] = {}
+                    
+                    # Inject task_id and batch_mode as hidden parameters
+                    node["inputs"]["task_id"] = task_id
+                    node["inputs"]["batch_mode"] = batch_mode
+                    
+                    self.LogInfo(f"Injected task_id={task_id}, batch_mode={batch_mode} into DeadlineSeed node {node_id}")
+                    nodes_modified = True
+            
+            return nodes_modified
+            
+        except Exception as e:
+            self.LogWarning(f"Error injecting deadline seed parameters: {e}")
+            return False
+
     def load_and_validate_workflow(self) -> dict:
         """Load workflow file and validate its structure"""
         workflow_file = self._get_workflow_file_path()
@@ -590,14 +718,20 @@ print('Dummy command timeout reached or task completed.')
             workflow_data = self._load_workflow_from_file(workflow_file)
             workflow_data = self.validate_workflow(workflow_data)
             
-            # Apply seed manipulation
-            task_id = self.GetCurrentTaskId()
-            seeds_modified = self.modify_workflow_seeds(workflow_data, task_id)
+            # Inject parameters for DeadlineDistributedSeed nodes
+            deadline_seeds_injected = self.inject_deadline_seed_parameters(workflow_data)
             
-            if seeds_modified:
-                self.LogInfo(f"Applied seed manipulation for task ID {task_id}")
+            # Apply seed manipulation only if no DeadlineDistributedSeed nodes are present
+            if not deadline_seeds_injected:
+                task_id = self.GetCurrentTaskId()
+                seeds_modified = self.modify_workflow_seeds(workflow_data, task_id)
+                
+                if seeds_modified:
+                    self.LogInfo(f"Applied seed manipulation for task ID {task_id}")
+                else:
+                    self.LogInfo(f"No seed manipulation applied for task ID {task_id}")
             else:
-                self.LogInfo(f"No seed manipulation applied for task ID {task_id}")
+                self.LogInfo("DeadlineSeed nodes detected - skipping automatic seed modification")
             
             return workflow_data
         except Exception as e:
@@ -607,7 +741,19 @@ print('Dummy command timeout reached or task completed.')
 
     def _get_workflow_file_path(self) -> str:
         """Get the workflow file path from plugin settings"""
-        workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", self.GetDataFilename())
+        # Check if we're in distributed/worker mode
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        
+        if distributed_mode or worker_mode:
+            # For distributed workers, use the WorkflowFile from plugin info (should be dummy workflow)
+            workflow_file = self.GetPluginInfoEntryWithDefault("WorkflowFile", "")
+            if not workflow_file:
+                # Fallback to ComfyWorkflowFile if WorkflowFile is not set
+                workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", self.GetDataFilename())
+        else:
+            # Normal batch mode
+            workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", self.GetDataFilename())
+        
         workflow_file = RepositoryUtils.CheckPathMapping(workflow_file)
         self.LogInfo(f"Workflow file setting from plugin info: '{workflow_file}'")
         return workflow_file
@@ -834,10 +980,28 @@ print('Dummy command timeout reached or task completed.')
         for i in range(1, self.chunk_size):
             prompt_workflow = copy.deepcopy(workflow_data)
             
-            # Modify seeds if needed
-            if self.GetPluginInfoEntryWithDefault("SeedMode", "fixed") != "fixed":
-                self.modify_workflow_seeds(prompt_workflow, i)
-                self.LogInfo(f"Modified seeds for additional prompt {i}")
+            # Check if workflow has DeadlineSeed nodes
+            has_deadline_seeds = any(
+                node.get("class_type") == "DeadlineSeed" 
+                for node in prompt_workflow.values() 
+                if isinstance(node, dict)
+            )
+            
+            if has_deadline_seeds:
+                # Update task_id for DeadlineSeed nodes (chunk-local indexing)
+                for node_id, node in prompt_workflow.items():
+                    if isinstance(node, dict) and node.get("class_type") == "DeadlineSeed":
+                        if "inputs" not in node:
+                            node["inputs"] = {}
+                        # Use i as the offset for chunks within the same task
+                        base_task_id = int(node["inputs"].get("task_id", 0))
+                        node["inputs"]["task_id"] = base_task_id + i
+                        self.LogInfo(f"Updated DeadlineSeed node {node_id} task_id to {base_task_id + i}")
+            else:
+                # Modify seeds using the old method
+                if self.GetPluginInfoEntryWithDefault("SeedMode", "fixed") != "fixed":
+                    self.modify_workflow_seeds(prompt_workflow, i)
+                    self.LogInfo(f"Modified seeds for additional prompt {i}")
             
             # Queue the workflow
             data = {"prompt": prompt_workflow, "client_id": self.client_id}
@@ -910,8 +1074,16 @@ print('Dummy command timeout reached or task completed.')
         self.SetProgress(100)
         self.SetStatusMessage("Finished Render")
         self.task_completed = True
-        self.signal_task_completion()
-        self.LogInfo(f"All {self.chunk_size} prompts in chunk completed, task marked as complete")
+        
+        # Check if we're in distributed worker mode
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        
+        if worker_mode and distributed_mode:
+            self.LogInfo("Distributed worker mode: Registration completed, entering keep-alive mode")
+            self._enter_distributed_keep_alive_mode()
+        else:
+            self.signal_task_completion()
+            self.LogInfo(f"All {self.chunk_size} prompts in chunk completed, task marked as complete")
 
     def _move_to_next_prompt(self):
         """Move to tracking the next prompt"""
@@ -1013,7 +1185,15 @@ print('Dummy command timeout reached or task completed.')
         while time.time() - start_time < DEFAULT_TIMEOUT and self.thread_running:
             if self.task_completed:
                 self.LogInfo("Task already marked as complete by stdout handler")
-                self.signal_task_completion()
+                
+                # Check if we're in distributed worker mode
+                worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+                
+                if worker_mode and distributed_mode:
+                    self.LogInfo("Distributed worker mode: Registration completed, entering keep-alive mode")
+                    self._enter_distributed_keep_alive_mode()
+                else:
+                    self.signal_task_completion()
                 return True
             
             if self.prompt_id:
@@ -1032,9 +1212,53 @@ print('Dummy command timeout reached or task completed.')
             return False
         
         if self.task_completed:
-            self.signal_task_completion()
+            # Check if we're in distributed worker mode
+            worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+            
+            if worker_mode and distributed_mode:
+                self.LogInfo("Distributed worker mode: Registration workflow completed, entering keep-alive mode")
+                self.LogInfo("Task will remain active to process distributed workflows from master")
+                
+                # Don't signal completion - enter keep-alive mode instead
+                self._enter_distributed_keep_alive_mode()
+            else:
+                # Normal mode - complete the task
+                self.signal_task_completion()
         
         return self.task_completed
+
+    def _enter_distributed_keep_alive_mode(self):
+        """Enter keep-alive mode for distributed workers"""
+        import time
+        import threading
+        
+        self.LogInfo("🔄 Entering distributed worker keep-alive mode...")
+        self.LogInfo("Worker will remain active until manually stopped or job is cancelled")
+        
+        def keep_alive_loop():
+            """Keep the task alive indefinitely"""
+            try:
+                while True:
+                    self.LogInfo("🔄 Distributed worker is alive and ready for workflows...")
+                    time.sleep(300)  # Log every 5 minutes
+            except KeyboardInterrupt:
+                self.LogInfo("🛑 Keep-alive interrupted by user")
+            except Exception as e:
+                self.LogInfo(f"❌ Keep-alive error: {e}")
+        
+        # Start keep-alive in daemon thread  
+        keep_alive_thread = threading.Thread(target=keep_alive_loop, daemon=True)
+        keep_alive_thread.start()
+        
+        try:
+            # Block main thread indefinitely
+            self.LogInfo("🔄 Main thread entering infinite wait...")
+            while True:
+                time.sleep(60)  # Check every minute
+        except KeyboardInterrupt:
+            self.LogInfo("🛑 Distributed worker keep-alive interrupted")
+        except Exception as e:
+            self.LogInfo(f"❌ Distributed worker keep-alive error: {e}")
 
     def _poll_prompt_status(self, poll_count: int) -> bool:
         """Poll the status of the current prompt"""
