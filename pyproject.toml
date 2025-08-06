@@ -31,9 +31,9 @@ Homepage = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin"
 Repository = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin"
 Issues = "https://github.com/doubletwisted/ComfyUI-Deadline-Plugin/issues"
 
-[tool.setuptools.py-modules]
+[tool.setuptools]
 # For flat structure with .py files in root
-py-modules = ["deadline_submit"]
+py-modules = ["deadline_submit", "deadline_api", "__init__"]
 
 [comfyui]
 PublisherId = "doubletwisted"
