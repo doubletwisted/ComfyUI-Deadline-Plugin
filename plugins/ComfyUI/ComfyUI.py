@@ -436,6 +436,8 @@ class ComfyUI(DeadlinePlugin):
         
         if os.path.exists(python_exe):
             self.LogInfo(f"Using ComfyUI embedded Python: {python_exe}")
+            # Set the Deadline worker name as environment variable for ComfyUI process
+            self._set_deadline_environment_variables()
             return python_exe
         else:
             error_msg = f"ComfyUI embedded Python not found at: {python_exe}. Please check your ComfyUIPath configuration."
@@ -669,6 +671,37 @@ print('Dummy command timeout reached or task completed.')
             return random.randint(0, MAX_SEED_VALUE)
         else:
             return random.randint(0, MAX_SEED_VALUE)
+
+    def _set_deadline_environment_variables(self):
+        """Set Deadline-specific environment variables for ComfyUI process"""
+        try:
+            # Get the actual Deadline worker name and set it as environment variable
+            slave_name = self.GetSlaveName()
+            if slave_name:
+                os.environ['DEADLINE_SLAVE_NAME'] = slave_name
+                self.LogInfo(f"Set DEADLINE_SLAVE_NAME environment variable: {slave_name}")
+            else:
+                self.LogWarning("Could not get Deadline worker name (GetSlaveName returned None)")
+                
+            # Also set other useful Deadline variables
+            try:
+                job = self.GetJob()
+                if job:
+                    os.environ['DEADLINE_JOB_ID'] = job.JobId
+                    self.LogInfo(f"Set DEADLINE_JOB_ID environment variable: {job.JobId}")
+            except:
+                self.LogWarning("Could not get job ID for environment variable")
+                
+            try:
+                task_id = self.GetCurrentTaskId()
+                if task_id is not None:
+                    os.environ['DEADLINE_TASK_ID'] = str(task_id)
+                    self.LogInfo(f"Set DEADLINE_TASK_ID environment variable: {task_id}")
+            except:
+                self.LogWarning("Could not get task ID for environment variable")
+                
+        except Exception as e:
+            self.LogWarning(f"Error setting Deadline environment variables: {e}")
 
     def inject_deadline_seed_parameters(self, workflow_data: dict) -> bool:
         """
