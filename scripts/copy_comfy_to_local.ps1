@@ -1,8 +1,10 @@
 # Copy ComfyUI Script - No Confirmation Version
-# Designed for Deadline Execute Command
+# Fill paths below accordingly
+# Run this script via Deadline Monitor. Worker => Remote Control => Execute Command => 
+# powershell.exe -ExecutionPolicy Bypass -File "X:\scripts\copy_comfy_to_local.ps1"
 
-$sourcePath = "X:\AI\ComfyUI_windows_portable3"
-$destPath = "C:\AI\ComfyUI_windows_portable3"
+$sourcePath = "X:\AI\ComfyUI_windows_portable4"
+$destPath = "C:\AI\ComfyUI_windows_portable4"
 $logDir = "X:\scripts\copy_comfy_to_local_logs"
 $computerName = $env:COMPUTERNAME
 

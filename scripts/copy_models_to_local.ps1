@@ -1,5 +1,6 @@
 # Enhanced Copy Models Script - With Full Diagnostics
-# Designed for Deadline Execute Command with pre-flight checks
+# Run this script via Deadline Monitor. Worker => Remote Control => Execute Command => 
+# powershell.exe -ExecutionPolicy Bypass -File "X:\scripts\copy_models_to_local.ps1" -DestinationDrive "C"
 
 param(
     [string]$DestinationDrive = "D",  # Change to C, E, etc.
@@ -48,31 +49,57 @@ function Write-DeadlineLog {
     }
 }
 
-# Function to calculate required space from model list
+# Minimal change: Calculate required delta space (only files that need copying)
 function Get-RequiredSpace {
-    param($FilePaths)
+    param(
+        [string[]]$FilePaths
+    )
     
-    $totalSize = 0
+    $totalDelta = 0
     $missingFiles = @()
     $validFiles = @()
+    $willCopy = @()
+
+    Write-DeadlineLog "Analyzing $($FilePaths.Count) files in model list (delta-aware)..."
     
-    Write-DeadlineLog "Analyzing $($FilePaths.Count) files in model list..."
-    
-    foreach ($file in $FilePaths) {
-        if (Test-Path $file) {
-            $fileSize = (Get-Item $file).Length
-            $totalSize += $fileSize
-            $validFiles += $file
+    foreach ($src in $FilePaths) {
+        if (-not (Test-Path -LiteralPath $src)) {
+            $missingFiles += $src
+            continue
+        }
+
+        $validFiles += $src
+
+        # Map to destination path using same root mapping as main script
+        $relativePath = $src -replace [regex]::Escape("X:\AI\models\"), ""
+        $dst = Join-Path $destDir $relativePath
+
+        $needsCopy = $false
+        if (-not (Test-Path -LiteralPath $dst)) {
+            $needsCopy = $true
         } else {
-            $missingFiles += $file
+            $sItem = Get-Item -LiteralPath $src
+            $dItem = Get-Item -LiteralPath $dst
+            if ($sItem.LastWriteTime -gt $dItem.LastWriteTime) {
+                $needsCopy = $true
+            } elseif ($sItem.Length -ne $dItem.Length) {
+                $needsCopy = $true
+            }
+        }
+
+        if ($needsCopy) {
+            $size = (Get-Item -LiteralPath $src).Length
+            $totalDelta += $size
+            $willCopy += $src
         }
     }
     
     return @{
-        TotalSizeBytes = $totalSize
-        TotalSizeGB = [math]::Round($totalSize / 1GB, 2)
+        TotalDeltaBytes = [int64]$totalDelta
+        TotalDeltaGB = [math]::Round($totalDelta / 1GB, 2)
         MissingFiles = $missingFiles
         ValidFiles = $validFiles
+        WillCopy = $willCopy
     }
 }
 
@@ -201,7 +228,7 @@ try {
     $availableSpace = Get-AvailableSpace -DrivePath $destDir
     
     Write-DeadlineLog "Valid files in list: $($spaceInfo.ValidFiles.Count)"
-    Write-DeadlineLog "Total space required: $($spaceInfo.TotalSizeGB) GB"
+    Write-DeadlineLog "Total space required (delta): $($spaceInfo.TotalDeltaGB) GB"
     Write-DeadlineLog "Available disk space: $($availableSpace.FreeGB) GB"
     
     if ($spaceInfo.MissingFiles.Count -gt 0) {
@@ -211,15 +238,15 @@ try {
         }
     }
     
-    # Check if we have enough space (with 15% buffer for safety)
+    # Check if we have enough space (with 15% buffer for safety), based on delta only
     $bufferMultiplier = 1.15
-    $requiredWithBuffer = $spaceInfo.TotalSizeBytes * $bufferMultiplier
+    $requiredWithBuffer = [int64]($spaceInfo.TotalDeltaBytes * $bufferMultiplier)
     $requiredWithBufferGB = [math]::Round($requiredWithBuffer / 1GB, 2)
     
     if ($availableSpace.FreeBytes -lt $requiredWithBuffer) {
         $script:logFile = "$logDir\$computerName-FAIL.txt"
         "" | Out-File -FilePath $script:logFile -Encoding UTF8
-        Write-DeadlineLog "ERROR: Insufficient disk space!" "Error"
+        Write-DeadlineLog "ERROR: Insufficient disk space for required delta!" "Error"
         Write-DeadlineLog "Required (with 15% buffer): $requiredWithBufferGB GB" "Error"
         Write-DeadlineLog "Available: $($availableSpace.FreeGB) GB" "Error"
         Write-DeadlineLog "Shortfall: $([math]::Round(($requiredWithBuffer - $availableSpace.FreeBytes) / 1GB, 2)) GB" "Error"
@@ -227,7 +254,7 @@ try {
         exit 1
     }
     
-    Write-DeadlineLog "Space check PASSED (buffer: $requiredWithBufferGB GB)" "Success"
+    Write-DeadlineLog "Space check PASSED (delta buffer: $requiredWithBufferGB GB)" "Success"
     
     # Test network connectivity to source
     Write-DeadlineLog "Testing network connectivity to source..."
@@ -293,7 +320,7 @@ if (Test-Path $destDir) {
                 Write-DeadlineLog "Warning: Some empty directories could not be removed" "Warning"
             }
             
-            Write-DeadlineLog "Cleanup completed: $deletedCount files removed, $(Format-FileSize $deletedSize) freed" "Success"
+            Write-DeadlineLog "Cleanup completed: $deletedCount files removed, $(Format-FileSize $deletedSize)) freed" "Success"
         } else {
             Write-DeadlineLog "No extra files found - destination is clean" "Success"
         }
@@ -462,12 +489,12 @@ $summaryLog += "PRE-FLIGHT CHECKS:`n"
 $summaryLog += "  Models in list: $($filePaths.Count)`n"
 $summaryLog += "  Valid source files: $($spaceInfo.ValidFiles.Count)`n"
 $summaryLog += "  Missing source files: $($spaceInfo.MissingFiles.Count)`n"
-$summaryLog += "  Total space required: $($spaceInfo.TotalSizeGB) GB`n"
+$summaryLog += "  Total space required (delta): $($spaceInfo.TotalDeltaGB) GB`n"
 $summaryLog += "  Available disk space: $($availableSpace.FreeGB) GB`n`n"
 
 $summaryLog += "CLEANUP RESULTS:`n"
 $summaryLog += "  Extra files removed: $deletedCount`n"
-$summaryLog += "  Space freed: $(Format-FileSize $deletedSize)`n`n"
+$summaryLog += "  Space freed: $(Format-FileSize $deletedSize))`n`n"
 
 $summaryLog += "COPY RESULTS:`n"
 $summaryLog += "  Files processed: $processedCount`n"
