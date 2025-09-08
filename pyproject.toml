@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-deadline-plugin"
-version = "1.0.0"
+version = "1.0.4"
 description = "ComfyUI plugin for submitting workflows to Thinkbox Deadline for distributed rendering"
 readme = "README.md"
 license = {text = "MIT"}
