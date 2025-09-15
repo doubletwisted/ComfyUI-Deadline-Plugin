@@ -2,6 +2,11 @@
 
 Submit ComfyUI workflows to Thinkbox Deadline render farm.
 
+Check out a quick demo showing how ComfyUI can play nice with Deadline.
+Please check out the video:
+
+<p align="center"> <a href="https://youtu.be/NFmIvEoEPiU"> <img src="https://img.youtube.com/vi/NFmIvEoEPiU/maxresdefault.jpg" alt="ComfyUI x Deadline: Leverage Your GPUs" /> </a> </p>
+
 ## Features
 
 - Submit ComfyUI workflows directly to Deadline
