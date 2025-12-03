@@ -49,6 +49,16 @@ Copy `plugins/ComfyUI/` to your Deadline Repository's `custom/plugins/` director
 ### Model Paths (Optional)
 For render farms with shared storage, copy `example_extra_model_paths.yaml` to your ComfyUI installation as `extra_model_paths.yaml` and update paths.
 
+### Multiple ComfyUI Install Paths
+In Deadline Monitor → Repository Options → ComfyUI plugin configuration, the `ComfyUI Installation Paths` field now accepts multiple entries. Add one path per line (drive letters, UNC shares, etc.). Workers will walk the list from top to bottom, apply Deadline path mapping, expand environment variables, and pick the first path that contains both `ComfyUI/main.py` and `python_embeded/python.exe`. This mirrors the multi-path behavior used by Deadline's Houdini plugin.
+
+Example:
+```
+C:\ComfyUI_windows_portable
+D:\Apps\ComfyUI
+\\NAS01\software\ComfyUI
+```
+
 ## How It Works
 
 1. Captures current ComfyUI workflow

@@ -119,6 +119,8 @@ class ComfyUI(DeadlinePlugin):
         self.progress_value = 0
         self.thread_running = True
         self.custom_output_dir_specified = False
+        self.comfyui_install_path = None
+        self.comfyui_path_candidates = []
         
         # Batch processing variables
         self.chunk_size = 1
@@ -129,6 +131,73 @@ class ComfyUI(DeadlinePlugin):
         self.prompt_ids = []
         self.completed_prompts = set()
         self.current_tracking_index = 0
+
+    def _resolve_comfyui_install_path(self) -> str:
+        """Resolve the ComfyUI installation path from multi-entry configuration."""
+        if self.comfyui_install_path:
+            return self.comfyui_install_path
+
+        config_entry = self.GetConfigEntryWithDefault("ComfyUIPath", "").strip()
+        if not config_entry:
+            error_msg = "ComfyUIPath configuration is empty. Please specify at least one installation path."
+            self.LogWarning(error_msg)
+            self.FailRender(error_msg)
+            return ""
+
+        raw_candidates = []
+        for line in config_entry.splitlines():
+            stripped_line = line.strip()
+            if not stripped_line:
+                continue
+            parts = [segment.strip().strip('\"').strip("'") for segment in stripped_line.split(";")]
+            raw_candidates.extend([part for part in parts if part])
+
+        if not raw_candidates:
+            error_msg = "ComfyUIPath configuration did not yield any usable paths."
+            self.LogWarning(error_msg)
+            self.FailRender(error_msg)
+            return ""
+
+        resolved_candidates = []
+        for candidate in raw_candidates:
+            try:
+                mapped = RepositoryUtils.CheckPathMapping(candidate)
+            except Exception as e:
+                self.LogWarning(f"Path mapping failed for '{candidate}': {e}")
+                mapped = candidate
+            expanded = os.path.expandvars(os.path.expanduser(mapped))
+            normalized = os.path.normpath(expanded)
+            resolved_candidates.append(normalized)
+
+        self.comfyui_path_candidates = resolved_candidates
+        self.LogInfo(f"Resolving ComfyUI installation path from {len(resolved_candidates)} candidate(s).")
+
+        for candidate in resolved_candidates:
+            if not candidate:
+                continue
+
+            python_exe = os.path.join(candidate, "python_embeded", "python.exe")
+            comfy_main = os.path.join(candidate, "ComfyUI", "main.py")
+            path_exists = os.path.exists(python_exe) and os.path.exists(comfy_main)
+
+            if path_exists:
+                self.comfyui_install_path = candidate
+                self.LogInfo(f"Using ComfyUI installation at: {candidate}")
+                return self.comfyui_install_path
+
+            missing_items = []
+            if not os.path.exists(python_exe):
+                missing_items.append("python_embeded/python.exe")
+            if not os.path.exists(comfy_main):
+                missing_items.append("ComfyUI/main.py")
+            missing_desc = ", ".join(missing_items) if missing_items else "required files"
+            self.LogWarning(f"Skipping ComfyUI path '{candidate}' (missing {missing_desc}).")
+
+        error_msg = "Unable to locate a valid ComfyUI installation from ComfyUIPath entries. "
+        error_msg += f"Tried: {', '.join(resolved_candidates)}"
+        self.LogWarning(error_msg)
+        self.FailRender(error_msg)
+        return ""
 
     def Cleanup(self):
         """Clean up plugin resources"""
@@ -251,7 +320,9 @@ class ComfyUI(DeadlinePlugin):
             self.LogInfo(f"Using configured default output directory: {self.comfyui_output_dir}")
         else:
             # Fall back to ComfyUI's standard output directory
-            comfyui_path = self.GetConfigEntry("ComfyUIPath")
+            comfyui_path = self._resolve_comfyui_install_path()
+            if not comfyui_path:
+                raise ComfyUIError("ComfyUI installation path could not be resolved for output directory setup.")
             self.comfyui_output_dir = os.path.join(comfyui_path, "ComfyUI", "output")
             self.custom_output_dir_specified = False
             self.LogInfo(f"Using ComfyUI's default output directory: {self.comfyui_output_dir}")
@@ -352,6 +423,9 @@ class ComfyUI(DeadlinePlugin):
         
         try:
             self._setup_batch_processing()
+            comfyui_path = self._resolve_comfyui_install_path()
+            if not comfyui_path:
+                raise ComfyUIError("ComfyUI installation path could not be resolved.")
             self._setup_output_directory()
             self._setup_temp_directory()
             self._calculate_comfyui_port()
@@ -431,7 +505,9 @@ class ComfyUI(DeadlinePlugin):
 
     def RenderExecutable(self):
         """Get the Python executable for ComfyUI"""
-        comfyui_path = self.GetConfigEntry("ComfyUIPath")
+        comfyui_path = self._resolve_comfyui_install_path()
+        if not comfyui_path:
+            return ""
         python_exe = os.path.join(comfyui_path, "python_embeded", "python.exe")
         
         if os.path.exists(python_exe):
@@ -440,14 +516,16 @@ class ComfyUI(DeadlinePlugin):
             self._set_deadline_environment_variables()
             return python_exe
         else:
-            error_msg = f"ComfyUI embedded Python not found at: {python_exe}. Please check your ComfyUIPath configuration."
+            error_msg = f"ComfyUI embedded Python not found at: {python_exe}. Please check your ComfyUIPath entries."
             self.LogWarning(error_msg)
             self.FailRender(error_msg)
             return ""
 
     def RenderArgument(self):
         """Build command line arguments for ComfyUI"""
-        comfyui_path = self.GetConfigEntry("ComfyUIPath")
+        comfyui_path = self._resolve_comfyui_install_path()
+        if not comfyui_path:
+            return ""
         comfyui_main_py = os.path.join(comfyui_path, "ComfyUI", "main.py")
         
         # Validate that main.py exists

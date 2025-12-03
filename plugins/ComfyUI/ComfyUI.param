@@ -17,12 +17,12 @@ Default=True
 Description=Not configurable
 
 [ComfyUIPath]
-Type=filename
-Label=ComfyUI Installation Path
+Type=multilinemultifilename
+Label=ComfyUI Installation Paths
 Category=Configuration
 Index=0
 Default=C:\\ComfyUI_windows_portable
-Description=Path to your ComfyUI portable installation directory. The plugin will automatically find main.py and the embedded Python executable.
+Description=One path per line (local drive letters, UNC paths, etc). Workers try each entry in order and pick the first install that contains ComfyUI\\main.py and python_embeded\\python.exe.
 
 [DefaultOutputDirectory]
 Type=filename
