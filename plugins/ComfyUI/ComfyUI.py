@@ -1016,11 +1016,44 @@ print('Dummy command timeout reached or task completed.')
             self._update_progress()
             self.LogInfo(f"Waiting for remaining prompts. {self.prompts_executed} of {self.chunk_size} completed")
 
+    def _is_non_critical_error(self, error_msg: str) -> bool:
+        """
+        Check if an error message is non-critical and shouldn't fail the task.
+
+        Args:
+            error_msg: The error message from ComfyUI stdout
+
+        Returns:
+            bool: True if the error is non-critical and should be ignored
+        """
+        non_critical_patterns = [
+            # Missing triton module during xformers initialization
+            "ModuleNotFoundError: No module named 'triton'",
+            # ImportError variant of missing triton
+            "ImportError: No module named 'triton'",
+            # A matching Triton is not available warning
+            "A matching Triton is not available, some optimizations will not be enabled",
+            # xformers version warnings
+            "WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations"
+        ]
+
+        for pattern in non_critical_patterns:
+            if pattern.lower() in error_msg.lower():
+                return True
+
+        return False
+
     def HandleStdoutError(self):
         """Handle errors from ComfyUI"""
         error_msg = self.GetRegexMatch(0)
+
+        # Filter out non-critical errors that shouldn't fail the task
+        if self._is_non_critical_error(error_msg):
+            self.LogInfo(f"Non-critical ComfyUI warning (continuing): {error_msg}")
+            return
+
         self.LogWarning(f"ComfyUI error: {error_msg}")
-        
+
         if not self.task_completed:
             self.FailRender(f"ComfyUI error: {error_msg}")
 
