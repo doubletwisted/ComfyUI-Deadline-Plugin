@@ -1,59 +1,47 @@
 # ComfyUI Deadline Plugin
 
-Submit ComfyUI workflows to Thinkbox Deadline.
+Submit ComfyUI jobs to Thinkbox Deadline from inside ComfyUI.
 
-## Features
+Quick demo:
 
-- Submit the current ComfyUI API prompt directly to Deadline
-- Submit-only local execution: normal output nodes are not rendered on the submitter
-- Deadline variation jobs using `batch_count` and `chunk_size`
-- Deterministic seed variation through the `DeadlineSeed` node
-- Stages referenced default ComfyUI input assets beside the output directory
-- Stores the normal ComfyUI `workflow.json` with node placement in the Deadline job files
-- Launches isolated portable Windows ComfyUI worker instances
-- Preserves compatibility flags used by `ComfyUI-Deadline-Distributed`
+<p align="center">
+  <a href="https://youtu.be/NFmIvEoEPiU">
+    <img src="https://img.youtube.com/vi/NFmIvEoEPiU/maxresdefault.jpg" alt="ComfyUI x Deadline demo" />
+  </a>
+</p>
 
-## Installation
+This plugin adds two nodes:
 
-### ComfyUI
+- `Submit to Deadline` sends the current workflow to the farm.
+- `DeadlineSeed` gives each Deadline variation a predictable seed.
+
+The submitter does not render the workflow locally. It only packages the job and sends it to Deadline.
+
+## Install
+
+Clone this into `ComfyUI/custom_nodes`:
 
 ```bash
-cd ComfyUI/custom_nodes
 git clone https://github.com/doubletwisted/ComfyUI-Deadline-Plugin.git
 ```
 
-Restart ComfyUI after installing or updating.
+Restart ComfyUI.
 
-### Deadline
-
-Deploy `plugins/ComfyUI/` into your Deadline Repository `custom/plugins/` directory, then restart Deadline services or reload the repository plugin.
-
-For render-farm maintenance, this repo includes publishable templates in `scripts/maintenance`. Copy those scripts to a shared path reachable by Workers, update their default paths or pass overrides, then submit them as Deadline maintenance jobs:
-
-```powershell
-python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type both
-```
-
-The maintenance submitter can submit the ComfyUI install sync, the model sync, or both:
-
-```powershell
-python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type installation
-python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type models
-```
-
-For Deadline repository plugin deploys, this repo includes a direct deploy helper:
+Then deploy the Deadline plugin:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\deploy_deadline_plugin.ps1
 ```
 
-The deploy script discovers the repository with `deadlinecommand -GetRepositoryPath`. You can also pass either the repository root or the custom plugins folder explicitly:
+The deploy script asks Deadline where the repository lives by running `deadlinecommand -GetRepositoryPath`, then copies `plugins/ComfyUI` into `custom/plugins/ComfyUI`.
+
+You can also point it at the repo yourself:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\deploy_deadline_plugin.ps1 -RepositoryPath "\\YOUR-SERVER\Repository\custom\plugins"
 ```
 
-In Deadline Monitor, configure the ComfyUI plugin `ComfyUI Installation Paths` setting. Use one portable Windows ComfyUI root per line:
+In Deadline Monitor, set the ComfyUI plugin's `ComfyUI Installation Paths`. Put one portable ComfyUI root per line:
 
 ```text
 C:\ComfyUI_windows_portable
@@ -61,36 +49,64 @@ D:\Apps\ComfyUI
 \\YOUR-SERVER\software\ComfyUI
 ```
 
-Workers try each entry in order after Deadline path mapping and pick the first path containing both `ComfyUI\main.py` and `python_embeded\python.exe`.
+Workers try those paths in order and use the first one that contains `ComfyUI\main.py` and `python_embeded\python.exe`.
 
-## Usage
+## Use It
 
-1. Add `Submit to Deadline` to the workflow.
-2. Set a farm-visible `output_directory`.
-3. Use `DeadlineSeed` anywhere a seed value should vary between Deadline variations.
-4. Run the workflow in ComfyUI.
-5. Monitor the submitted job in Deadline Monitor.
+Add `Submit to Deadline` to your workflow, set `output_directory` to a path the farm can see, and run the workflow in ComfyUI.
 
-`batch_count` is the total number of Deadline variations. `chunk_size` is how many variations a single Deadline task should queue into its worker ComfyUI instance. These are not animation frame ranges; Deadline frames are used internally as variation indices.
+Use `batch_count` for how many variations you want. Use `chunk_size` for how many variations a Deadline task should process before it finishes. These are variations, not animation frames.
 
-For a `DeadlineSeed` base seed of `1000`, variation `0` uses `1000`, variation `1` uses `1001`, and so on. The worker rewrites the queued prompt before execution, so saved image metadata contains the actual seed used. Additional Deadline metadata is written under `extra_pnginfo.deadline`.
+If you want seeds to change per variation, use `DeadlineSeed`. A base seed of `1000` becomes:
 
-Deadline jobs include two workflow files when ComfyUI provides the UI workflow metadata: `prompt_to_execute.json` is the API prompt used by the worker, and `workflow.json` is the standard ComfyUI workflow with node positions. Patched workers embed the standard workflow metadata into outputs, so dropping a generated image back into ComfyUI opens the normal graph layout, not the API prompt format.
+```text
+variation 0 -> 1000
+variation 1 -> 1001
+variation 2 -> 1002
+```
 
-## Input Staging
+## Input Files
 
-Default ComfyUI upload nodes such as `Load Image`, `Load Audio`, and `Load Video` store files in the local `ComfyUI/input` folder. On submission, this plugin copies referenced input assets to a shared sibling input folder beside the output directory:
+Normal ComfyUI loader nodes copy pasted or uploaded files into `ComfyUI/input`. That folder usually exists only on the machine where you submitted the job, so the plugin stages those referenced files next to your output folder:
 
 ```text
 <output parent>\input\
 ```
 
-Workers launch ComfyUI with `--input-directory` pointing at that staged folder. The embedded standard workflow metadata is rewritten to use absolute staged asset paths, so another ComfyUI session on a different machine can reopen the generated image as long as that shared input path is visible there. Missing or invalid referenced input files fail submission before the Deadline job is sent.
+Workers start ComfyUI with that folder as `--input-directory`.
 
-Only files referenced by the submitted prompt are copied. Existing identical files are reused; conflicting filenames get a submission suffix. Absolute path loader nodes are left unchanged and must already point to farm-visible storage.
+Only files used by the submitted prompt are copied. If a file already exists and is identical, it is reused. If the name collides with a different file, the plugin gives the staged copy a unique suffix.
+
+Absolute path loader nodes are left alone. Those paths must already be valid on the farm.
+
+## Workflow Metadata
+
+Deadline gets both files:
+
+- `prompt_to_execute.json` is the API prompt the worker renders.
+- `workflow.json` is the normal ComfyUI workflow with node positions.
+
+The worker writes the normal workflow metadata back into the output image when ComfyUI provides it. So dragging the finished image back into ComfyUI should reopen the readable graph, not the ugly API-format graph.
+
+## Maintenance Scripts
+
+There are sanitized Deadline maintenance-job templates in `scripts/maintenance`.
+
+Copy them somewhere your workers can reach, edit the default paths, then submit sync jobs with:
+
+```powershell
+python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type both
+```
+
+You can also run only one side:
+
+```powershell
+python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type installation
+python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type models
+```
 
 ## Notes
 
-- This V2 path targets portable Windows ComfyUI workers.
-- Deadline owns render timeout policy; configure timeouts in Deadline Monitor.
-- The base plugin no longer registers mock `/deadline/*` routes. Distributed-worker routes remain owned by `ComfyUI-Deadline-Distributed`.
+- This targets portable Windows ComfyUI workers.
+- Deadline handles render timeouts. Set those in Deadline Monitor.
+- The old fake `/deadline/*` API routes are gone from this plugin. If you use `ComfyUI-Deadline-Distributed`, it owns its own routes.
