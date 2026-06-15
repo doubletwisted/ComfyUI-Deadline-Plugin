@@ -1,445 +1,376 @@
-# deadline_submit.py
-
 """
-ComfyUI Deadline Submission Node
-by Dominik Bargiel dominikbargiel97@gmail.com
+ComfyUI Deadline submission nodes.
 
-A ComfyUI custom node for submitting workflows to Thinkbox Deadline render farm.
+This module owns the ComfyUI-side submission flow. It packages the current API
+prompt, stages referenced input assets, and submits a render job to Deadline.
 """
 
-import os
-import sys
+import copy
+import filecmp
 import json
-import tempfile
-import subprocess
-import uuid
-import time
+import os
 import re
-from typing import Optional, Dict, List, Any, Union, Tuple
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
-# Configuration constants
+
 DEADLINE_COMMAND_PATHS = {
-    'windows': "C:\\Program Files\\Thinkbox\\Deadline10\\bin\\deadlinecommand.exe",
-    'linux': "/opt/Thinkbox/Deadline10/bin/deadlinecommand"
+    "windows": "C:\\Program Files\\Thinkbox\\Deadline10\\bin\\deadlinecommand.exe",
+    "linux": "/opt/Thinkbox/Deadline10/bin/deadlinecommand",
 }
 
-# Node configuration constants
+DEADLINE_SUBMIT_NODE_TYPES = {"DeadlineSubmit", "SaveAndSubmitNode"}
+OUTPUT_NODE_TYPES = {"SaveImage", "PreviewImage", "SaveVideo", "VHS_VideoCombine"}
+INPUT_LOADER_FIELDS = {
+    "LoadImage": ("image",),
+    "LoadImageMask": ("image",),
+    "LoadAudio": ("audio",),
+    "LoadVideo": ("file",),
+}
+MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".exr",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v",
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
+}
+
+
 class NodeDefaults:
-    JOB_NAME = "ComfyUI via DeadlineNode"
+    JOB_NAME = "ComfyUI via Deadline"
     PRIORITY = 50
     POOL = "none"
     GROUP = "none"
     BATCH_COUNT = 1
     CHUNK_SIZE = 1
-    MAX_BATCH_COUNT = 100
-    MAX_CHUNK_SIZE = 16
+    MAX_BATCH_COUNT = 10000
+    MAX_CHUNK_SIZE = 256
     MAX_PRIORITY = 100
 
+
 class DeadlineCommandHelper:
-    """Helper class for interacting with Deadline command line"""
-    
     @staticmethod
     def get_deadline_command() -> str:
-        """Get the path to the deadlinecommand executable"""
-        deadline_bin = ""
-        try:
-            deadline_bin = os.environ.get('DEADLINE_PATH', '')
-        except KeyError:
-            pass
+        deadline_bin = os.environ.get("DEADLINE_PATH", "")
 
         if not deadline_bin and os.path.exists("/Users/Shared/Thinkbox/DEADLINE_PATH"):
             try:
-                with open("/Users/Shared/Thinkbox/DEADLINE_PATH") as f:
-                    deadline_bin = f.read().strip()
+                with open("/Users/Shared/Thinkbox/DEADLINE_PATH", "r", encoding="utf-8") as handle:
+                    deadline_bin = handle.read().strip()
             except Exception:
-                pass
+                deadline_bin = ""
 
+        candidates = []
         if deadline_bin:
-            deadline_command = os.path.join(deadline_bin, "deadlinecommand")
-            if os.path.exists(deadline_command):
-                return deadline_command
+            candidates.append(os.path.join(deadline_bin, "deadlinecommand.exe" if os.name == "nt" else "deadlinecommand"))
+        candidates.append(DEADLINE_COMMAND_PATHS["windows"] if sys.platform.startswith("win") else DEADLINE_COMMAND_PATHS["linux"])
 
-        # Try platform-specific default paths
-        if sys.platform.startswith('win'):
-            default_path = DEADLINE_COMMAND_PATHS['windows']
-        else:
-            default_path = DEADLINE_COMMAND_PATHS['linux']
-            
-        if os.path.exists(default_path):
-            return default_path
-        
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
         return ""
 
     @staticmethod
-    def call_deadline_command(arguments: List[str], hide_window: bool = True, read_stdout: bool = True) -> str:
-        """Call deadlinecommand with the given arguments"""
+    def call_deadline_command(arguments: List[str], hide_window: bool = True) -> str:
         deadline_command = DeadlineCommandHelper.get_deadline_command()
         if not deadline_command:
-            raise Exception("Deadline command not found")
-            
+            raise RuntimeError("Deadline command not found. Set DEADLINE_PATH or install Deadline Client.")
+
         startupinfo = None
         creationflags = 0
-        
-        if os.name == 'nt':
-            if hide_window:
-                try:
-                    startupinfo = subprocess.STARTUPINFO()
-                    if hasattr(subprocess, '_subprocess') and hasattr(subprocess._subprocess, 'STARTF_USESHOWWINDOW'):
-                        startupinfo.dwFlags |= subprocess._subprocess.STARTF_USESHOWWINDOW
-                    elif hasattr(subprocess, 'STARTF_USESHOWWINDOW'):
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                except:
-                    pass
-            else:
-                CREATE_NO_WINDOW = 0x08000000
-                creationflags = CREATE_NO_WINDOW
-        
-        full_arguments = [deadline_command] + arguments
-        
-        proc = subprocess.Popen(
-            full_arguments, 
-            stdin=subprocess.PIPE, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            startupinfo=startupinfo, 
-            creationflags=creationflags
+        if os.name == "nt" and hide_window:
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            except Exception:
+                startupinfo = None
+        elif os.name == "nt":
+            creationflags = 0x08000000
+
+        process = subprocess.Popen(
+            [deadline_command] + arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
         )
-        
-        output = ""
-        if read_stdout:
-            output, errors = proc.communicate()
-            
-            if sys.version_info[0] >= 3 and isinstance(output, bytes):
-                output = output.decode(errors="replace")
-        
+        stdout, stderr = process.communicate()
+        output = stdout.decode(errors="replace") if isinstance(stdout, bytes) else str(stdout)
+        errors = stderr.decode(errors="replace") if isinstance(stderr, bytes) else str(stderr)
+
+        if process.returncode != 0:
+            raise RuntimeError(f"deadlinecommand failed with code {process.returncode}: {errors or output}")
         return output
 
     @staticmethod
     def get_job_id_from_submission(submission_results: str) -> str:
-        """Parse the job ID from the submission results"""
-        for line in submission_results.split():
-            if line.startswith("JobID="):
-                return line.replace("JobID=", "").strip()
+        for token in submission_results.replace("\r", "\n").split():
+            if token.startswith("JobID="):
+                return token.split("=", 1)[1].strip()
         return ""
 
+
 class WorkflowProcessor:
-    """Handles workflow data processing and validation"""
-    
     @staticmethod
-    def normalize_workflow(workflow_data: Union[Dict, List]) -> Optional[Dict]:
-        """Normalize workflow data to ensure compatibility"""
-        if not workflow_data:
-            print("Deadline Submission: Error - Empty workflow data.")
-            return None
-            
-        # If workflow is already in UI format (dictionary with node IDs as keys)
-        if isinstance(workflow_data, dict):
-            is_ui_format = any(isinstance(key, str) and key.isdigit() for key in workflow_data.keys())
-            if is_ui_format:
-                return workflow_data
-                
-        # If it's the API format (list of nodes)
-        if isinstance(workflow_data, list):
-            return WorkflowProcessor._convert_api_to_ui_format(workflow_data)
-            
-        # Not recognized format
-        print(f"Deadline Submission: Warning - Unrecognized workflow format. Attempting to use as-is.")
-        return workflow_data if isinstance(workflow_data, dict) else None
+    def normalize_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(prompt, dict) or not prompt:
+            raise ValueError("ComfyUI did not provide a valid API prompt.")
+        return copy.deepcopy(prompt)
 
     @staticmethod
-    def _convert_api_to_ui_format(workflow_list: List) -> Dict:
-        """Convert API format workflow to UI format"""
-        ui_format = {}
-        for node in workflow_list:
-            if isinstance(node, list) and len(node) >= 3:
-                node_id = str(node[0])
-                ui_format[node_id] = {
-                    "class_type": node[1],
-                    "inputs": node[2]
-                }
-        return ui_format
+    def prepare_for_worker(prompt: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = WorkflowProcessor.normalize_prompt(prompt)
+        removed = []
+        for node_id, node in list(prepared.items()):
+            if isinstance(node, dict) and node.get("class_type") in DEADLINE_SUBMIT_NODE_TYPES:
+                removed.append(node_id)
+                del prepared[node_id]
+
+        if removed:
+            print(f"Deadline Submission: Removed submit node(s) from worker prompt: {', '.join(map(str, removed))}")
+
+        WorkflowProcessor.validate_worker_prompt(prepared)
+        return prepared
 
     @staticmethod
-    def validate_workflow(workflow_data: Dict) -> bool:
-        """Basic validation that workflow contains important nodes"""
-        if not workflow_data:
-            return False
-            
-        has_output_node = False
-        has_checkpoint = False
-        
-        output_node_types = ["SaveImage", "PreviewImage", "SaveVideo"]
-        checkpoint_types = ["CheckpointLoaderSimple", "CheckpointLoader", "UNETLoader"]
-        
-        for node_id, node in workflow_data.items():
-            if not isinstance(node, dict) or "class_type" not in node:
+    def validate_worker_prompt(prompt: Dict[str, Any]) -> None:
+        if not prompt:
+            raise ValueError("Worker prompt is empty after removing Deadline submit nodes.")
+
+        has_output = any(
+            isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES
+            for node in prompt.values()
+        )
+        if not has_output:
+            print("Deadline Submission: Warning - worker prompt has no known output node.")
+
+
+class InputAssetStager:
+    def __init__(self, output_directory: str, job_name: str, submission_id: str):
+        self.output_directory = os.path.abspath(output_directory)
+        self.job_name = job_name
+        self.submission_id = submission_id
+
+    def stage_referenced_assets(self, prompt: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, Any]]]:
+        input_dir = self._get_local_input_directory()
+        references = self._collect_references(prompt, input_dir)
+        staging_dir = self._staging_directory()
+        manifest_path = os.path.join(staging_dir, f"deadline_input_manifest_{self.submission_id}.json")
+
+        if not references:
+            os.makedirs(staging_dir, exist_ok=True)
+            manifest = {
+                "submission_id": self.submission_id,
+                "input_directory": staging_dir,
+                "assets": [],
+            }
+            self._write_manifest(manifest_path, manifest)
+            return staging_dir, manifest_path, []
+
+        os.makedirs(staging_dir, exist_ok=True)
+        assets = []
+        for original_rel_path, source_path in sorted(references.items()):
+            staged_rel_path, destination_path = self._resolve_destination(staging_dir, original_rel_path, source_path)
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            if not os.path.exists(destination_path):
+                shutil.copy2(source_path, destination_path)
+            assets.append({
+                "original_relative_path": original_rel_path.replace("\\", "/"),
+                "staged_relative_path": staged_rel_path.replace("\\", "/"),
+                "relative_path": staged_rel_path.replace("\\", "/"),
+                "source": source_path,
+                "destination": destination_path,
+                "size": os.path.getsize(destination_path),
+            })
+
+        manifest = {
+            "submission_id": self.submission_id,
+            "input_directory": staging_dir,
+            "assets": assets,
+        }
+        self._write_manifest(manifest_path, manifest)
+        print(f"Deadline Submission: Staged {len(assets)} input asset(s) to {staging_dir}")
+        return staging_dir, manifest_path, assets
+
+    def _get_local_input_directory(self) -> str:
+        try:
+            import folder_paths
+            return os.path.abspath(folder_paths.get_input_directory())
+        except Exception as exc:
+            raise RuntimeError(f"Could not resolve ComfyUI input directory: {exc}")
+
+    def _collect_references(self, prompt: Dict[str, Any], input_dir: str) -> Dict[str, str]:
+        references: Dict[str, str] = {}
+        for node in prompt.values():
+            if not isinstance(node, dict):
                 continue
-                
+
             class_type = node.get("class_type", "")
-            
-            if class_type in output_node_types:
-                has_output_node = True
-                
-            if class_type in checkpoint_types:
-                has_checkpoint = True
-                
-        if not has_output_node:
-            print("Deadline Submission: Warning - No output nodes found in workflow.")
-            
-        if not has_checkpoint:
-            print("Deadline Submission: Warning - No checkpoint loader found in workflow.")
-            
-        return True
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
 
-    @staticmethod
-    def save_workflow_file(workflow_data: Dict, file_path: Optional[str] = None) -> Optional[str]:
-        """Save workflow data to a file for submission"""
-        if not workflow_data:
-            print("Deadline Submission: No workflow data to save.")
+            candidate_values: List[Tuple[Any, bool]] = []
+            for field_name in INPUT_LOADER_FIELDS.get(class_type, ()):
+                if field_name in inputs:
+                    candidate_values.append((inputs[field_name], True))
+
+            for value in inputs.values():
+                if isinstance(value, str):
+                    candidate_values.append((value, False))
+
+            for value, strict in candidate_values:
+                if not isinstance(value, str):
+                    continue
+                resolved = self._resolve_input_file(value, input_dir, strict)
+                if not resolved:
+                    continue
+                rel_path, source_path = resolved
+                references[rel_path] = source_path
+        return references
+
+    def _resolve_destination(self, staging_dir: str, rel_path: str, source_path: str) -> Tuple[str, str]:
+        destination_path = os.path.abspath(os.path.join(staging_dir, rel_path))
+        if not os.path.exists(destination_path):
+            return rel_path, destination_path
+
+        if os.path.isfile(destination_path) and filecmp.cmp(source_path, destination_path, shallow=False):
+            return rel_path, destination_path
+
+        stem, extension = os.path.splitext(rel_path)
+        staged_rel_path = f"{stem}_{self.submission_id}{extension}"
+        return staged_rel_path, os.path.abspath(os.path.join(staging_dir, staged_rel_path))
+
+    def _resolve_input_file(self, value: str, input_dir: str, strict: bool) -> Optional[Tuple[str, str]]:
+        clean_value, annotation = self._strip_annotation(value)
+        if annotation in {"output", "temp"}:
             return None
-            
-        if not file_path:
-            temp_dir = tempfile.gettempdir()
-            file_path = os.path.join(temp_dir, f"comfyui_workflow_for_deadline_{uuid.uuid4()}.json")
-        
-        try:
-            with open(file_path, 'w') as f:
-                json.dump(workflow_data, f, indent=2)
-                
-            # Create a metadata file for debugging
-            WorkflowProcessor._create_metadata_file(file_path)
-                
-            print(f"Deadline Submission: Successfully saved workflow for submission to: {file_path}")
-            return file_path
-        except Exception as e:
-            print(f"Deadline Submission: Error saving workflow file: {e}")
+        if not clean_value or os.path.isabs(clean_value):
+            return None
+        if os.path.splitext(clean_value)[1].lower() not in MEDIA_EXTENSIONS:
             return None
 
-    @staticmethod
-    def _create_metadata_file(workflow_path: str):
-        """Create a metadata file alongside the workflow"""
+        candidate = os.path.abspath(os.path.join(input_dir, clean_value))
         try:
-            with open(f"{workflow_path}.metadata", 'w') as f:
-                metadata = {
-                    "generator": "ComfyUI Deadline Submission Plugin",
-                    "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "notes": "This workflow was captured and prepared for Deadline rendering."
-                }
-                json.dump(metadata, f, indent=2)
-        except Exception as e:
-            print(f"Deadline Submission: Warning - Could not create metadata file: {e}")
+            common = os.path.commonpath([input_dir, candidate])
+        except ValueError:
+            common = ""
+        if common != input_dir:
+            raise ValueError(f"Input asset escapes ComfyUI input directory: {value}")
+        if not os.path.isfile(candidate):
+            if not strict:
+                return None
+            raise FileNotFoundError(f"Referenced input asset was not found: {value} ({candidate})")
 
-    @staticmethod
-    def prepare_workflow_for_submission(workflow_data: Dict) -> Dict:
-        """Prepare workflow by setting DeadlineSubmit nodes to bypassed"""
-        normalized_workflow = WorkflowProcessor.normalize_workflow(workflow_data)
-        if not normalized_workflow:
-            raise Exception("Failed to normalize workflow")
-            
-        # Set any DeadlineSubmit nodes to bypassed
-        deadline_node_types = ["DeadlineSubmit", "SaveAndSubmitNode"]
-        for node_id, node in normalized_workflow.items():
-            if isinstance(node, dict) and node.get("class_type") in deadline_node_types:
-                print(f"Deadline Submission: Setting node {node_id} to bypassed")
-                if "inputs" not in node:
-                    node["inputs"] = {}
-                node["inputs"]["bypass"] = True
-        
-        WorkflowProcessor.validate_workflow(normalized_workflow)
-        return normalized_workflow
+        rel_path = os.path.relpath(candidate, input_dir)
+        return rel_path, candidate
+
+    def _strip_annotation(self, value: str) -> Tuple[str, Optional[str]]:
+        match = re.match(r"^(.*)\s+\[(input|output|temp)\]\s*$", value)
+        if not match:
+            return value.strip().replace("/", os.sep), None
+        return match.group(1).strip().replace("/", os.sep), match.group(2)
+
+    def _staging_directory(self) -> str:
+        parent = os.path.dirname(self.output_directory.rstrip("\\/"))
+        return os.path.join(parent, "input")
+
+    def _write_manifest(self, manifest_path: str, manifest: Dict[str, Any]) -> None:
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+
 
 class DeadlineJobSubmitter:
-    """Handles submission of jobs to Deadline"""
-    
-    def __init__(self, workflow_data: Dict, job_config: Dict):
+    def __init__(self, workflow_data: Dict[str, Any], job_config: Dict[str, Any]):
         self.workflow_data = workflow_data
         self.job_config = job_config
 
     def submit_job(self) -> Tuple[bool, str]:
-        """Submit the job to Deadline and return success status and job ID or error message"""
         try:
-            workflow_path = self._save_workflow()
-            if not workflow_path:
-                return False, "Failed to save workflow for submission"
-            
-            job_id = self._submit_to_deadline(workflow_path)
-            if job_id:
-                return True, job_id
-            else:
-                return False, "Job submitted but no JobID returned"
-                
-        except Exception as e:
-            return False, f"Error submitting to Deadline: {str(e)}"
-
-    def _save_workflow(self) -> Optional[str]:
-        """Save the workflow to a temporary file"""
-        return WorkflowProcessor.save_workflow_file(self.workflow_data)
-
-    def _submit_to_deadline(self, workflow_path: str) -> str:
-        """Submit the workflow to Deadline and return job ID"""
-        submission_temp_dir = tempfile.mkdtemp(prefix="comfy_deadline_job_")
-        
-        try:
-            job_info_file, plugin_info_file, workflow_copy = self._create_submission_files(
-                submission_temp_dir, workflow_path
-            )
-            
-            command_args = [job_info_file, plugin_info_file, workflow_copy]
-            result = DeadlineCommandHelper.call_deadline_command(command_args)
-            
+            submission_dir = tempfile.mkdtemp(prefix="comfy_deadline_job_")
+            job_info_file, plugin_info_file, auxiliary_files = self._create_submission_files(submission_dir)
+            result = DeadlineCommandHelper.call_deadline_command([job_info_file, plugin_info_file] + auxiliary_files)
             job_id = DeadlineCommandHelper.get_job_id_from_submission(result)
-            if job_id:
-                print(f"Deadline Submission: Successfully submitted job. JobID: {job_id}")
-                return job_id
-            else:
-                print(f"Deadline Submission: Job submitted but JobID not found. Result: {result}")
-                return ""
-                
-        except Exception as e:
-            print(f"Deadline Submission: Error during submission: {e}")
-            raise
+            if not job_id:
+                return False, f"Deadline submission did not return a JobID. Output: {result}"
+            return True, job_id
+        except Exception as exc:
+            return False, str(exc)
 
-    def _create_submission_files(self, temp_dir: str, workflow_path: str) -> Tuple[str, str, str]:
-        """Create job info and plugin info files for submission"""
-        job_info_file = os.path.join(temp_dir, "job_info.txt")
-        plugin_info_file = os.path.join(temp_dir, "plugin_info.txt")
-        
-        # Copy workflow to submission directory
-        workflow_copy = os.path.join(temp_dir, "workflow_to_submit.json")
-        try:
-            import shutil
-            shutil.copy2(workflow_path, workflow_copy)
-        except Exception:
-            workflow_copy = workflow_path
+    def _create_submission_files(self, submission_dir: str) -> Tuple[str, str, List[str]]:
+        job_info_file = os.path.join(submission_dir, "job_info.txt")
+        plugin_info_file = os.path.join(submission_dir, "plugin_info.txt")
+        prompt_file = os.path.join(submission_dir, "prompt_to_execute.json")
+        standard_workflow_file = os.path.join(submission_dir, "workflow.json")
 
-        self._create_job_info_file(job_info_file)
-        self._create_plugin_info_file(plugin_info_file)
-        
-        return job_info_file, plugin_info_file, workflow_copy
+        with open(prompt_file, "w", encoding="utf-8") as handle:
+            json.dump(self.workflow_data, handle, indent=2)
 
-    def _create_job_info_file(self, job_info_file: str):
-        """Create the job info file"""
+        auxiliary_files = [prompt_file]
+        standard_workflow = self.job_config.get("standard_workflow")
+        if standard_workflow:
+            with open(standard_workflow_file, "w", encoding="utf-8") as handle:
+                json.dump(standard_workflow, handle, indent=2)
+            auxiliary_files.append(standard_workflow_file)
+
+        self._write_job_info(job_info_file)
+        self._write_plugin_info(plugin_info_file)
+        return job_info_file, plugin_info_file, auxiliary_files
+
+    def _write_job_info(self, path: str) -> None:
         config = self.job_config
-        
-        with open(job_info_file, 'w') as f:
-            f.write(f"Plugin=ComfyUI\n")
-            f.write(f"Name={config['job_name']}\n")
-            f.write(f"Comment={config.get('comment', '')}\n")
-            f.write(f"Department={config.get('department', '')}\n")
-            f.write(f"Pool={config['pool'] if config['pool'] != 'none' else ''}\n")
-            f.write(f"Group={config['group'] if config['group'] != 'none' else ''}\n")
-            f.write(f"Priority={config['priority']}\n")
-            
-            # Add frame range if batch count > 1
-            if config['batch_count'] > 1:
-                f.write(f"Frames=0-{config['batch_count'] - 1}\n")
-                f.write(f"ChunkSize={config['chunk_size']}\n")
-            else:
-                f.write(f"Frames=0\n")
-                f.write(f"ChunkSize=1\n")
-            
-            # Add output directory if specified
-            if config.get('output_directory'):
-                abs_output_dir = os.path.abspath(config['output_directory'].strip())
-                f.write(f"OutputDirectory0={abs_output_dir}\n")
+        batch_count = int(config["batch_count"])
+        chunk_size = max(1, int(config["chunk_size"]))
+        output_dir = os.path.abspath(config["output_directory"])
 
-    def _create_plugin_info_file(self, plugin_info_file: str):
-        """Create the plugin info file"""
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("Plugin=ComfyUI\n")
+            handle.write(f"Name={config['job_name']}\n")
+            handle.write(f"Comment={config.get('comment', '')}\n")
+            handle.write(f"Department={config.get('department', '')}\n")
+            handle.write(f"Pool={'' if config['pool'] == 'none' else config['pool']}\n")
+            handle.write(f"Group={'' if config['group'] == 'none' else config['group']}\n")
+            handle.write(f"Priority={int(config['priority'])}\n")
+            handle.write(f"Frames=0-{batch_count - 1}\n")
+            handle.write(f"ChunkSize={chunk_size}\n")
+            handle.write(f"OutputDirectory0={output_dir}\n")
+
+    def _write_plugin_info(self, path: str) -> None:
         config = self.job_config
-        
-        with open(plugin_info_file, 'w') as f:
-            if config.get('output_directory'):
-                abs_output_dir = os.path.abspath(config['output_directory'].strip())
-                f.write(f"JobOutputDirectory={abs_output_dir}\n")
-            
-            f.write("DefaultCudaDeviceZero=True\n")
-            
-            # Note: Seed handling is now managed by DeadlineSeed nodes
-            f.write("SeedMode=fixed\n")
-            
-            if config['batch_count'] > 1:
-                f.write("BatchMode=True\n")
+        entries = {
+            "StandardWorkflowFile": "workflow.json" if config.get("standard_workflow") else "",
+            "JobOutputDirectory": os.path.abspath(config["output_directory"]),
+            "JobInputDirectory": os.path.abspath(config["input_directory"]),
+            "InputManifestFile": os.path.abspath(config["input_manifest"]),
+            "SubmissionId": config["submission_id"],
+            "BatchCount": str(int(config["batch_count"])),
+            "BatchMode": "True",
+            "DefaultCudaDeviceZero": "True",
+            "SeedMode": "fixed",
+            "WorkerMode": "False",
+            "DistributedMode": "False",
+            "ForceNewInstance": "True",
+        }
 
-class ExecutionInterruptor:
-    """Handles interrupting local ComfyUI execution"""
-    
-    @staticmethod
-    def interrupt_local_execution():
-        """Attempt to interrupt local ComfyUI execution"""
-        try:
-            import sys
-            
-            # Try to interrupt using the known working approach
-            if ExecutionInterruptor._try_nodes_interrupt():
-                print("Deadline Submission: Successfully interrupted via nodes module")
-            elif ExecutionInterruptor._try_comfy_graph_interrupt():
-                print("Deadline Submission: Successfully interrupted via comfy.graph module")
-            else:
-                print("Deadline Submission: No interruption mechanism found, local execution may still occur")
-                
-        except Exception as e:
-            print(f"Deadline Submission: Unable to prevent local execution (safe to ignore): {str(e)}")
+        with open(path, "w", encoding="utf-8") as handle:
+            for key, value in entries.items():
+                if value != "":
+                    handle.write(f"{key}={value}\n")
 
-    @staticmethod
-    def _try_nodes_interrupt() -> bool:
-        """Try to interrupt using the nodes module"""
-        import sys
-        
-        if 'nodes' not in sys.modules:
-            return False
-            
-        nodes_module = sys.modules['nodes']
-        if not hasattr(nodes_module, 'interrupt_processing'):
-            return False
-            
-        interrupt_attr = getattr(nodes_module, 'interrupt_processing')
-        if callable(interrupt_attr):
-            interrupt_attr(True)
-        else:
-            nodes_module.interrupt_processing = True
-            
-        return True
-
-    @staticmethod
-    def _try_comfy_graph_interrupt() -> bool:
-        """Try to interrupt using the comfy.graph module"""
-        import sys
-        
-        if 'comfy' not in sys.modules:
-            return False
-            
-        comfy_module = sys.modules['comfy']
-        if not hasattr(comfy_module, 'graph'):
-            return False
-            
-        graph_module = comfy_module.graph
-        if not hasattr(graph_module, 'interrupt_processing'):
-            return False
-            
-        interrupt_attr = getattr(graph_module, 'interrupt_processing')
-        if callable(interrupt_attr):
-            interrupt_attr(True)
-        else:
-            graph_module.interrupt_processing = True
-            
-        return True
 
 class DeadlineSeed:
-    """
-    Distributes seed values across Deadline tasks.
-    On first task: passes through the original seed.
-    On subsequent tasks: adds offset based on task ID.
-    """
-    
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "seed": ("INT", {
-                    "default": 1125899906842, 
+                    "default": 1125899906842,
                     "min": 0,
                     "max": 1125899906842624,
-                    "forceInput": False  # Widget by default, can be converted to input
+                    "forceInput": False,
                 }),
             },
             "hidden": {
@@ -447,100 +378,64 @@ class DeadlineSeed:
                 "batch_mode": ("BOOLEAN", {"default": False}),
             },
         }
-    
+
     RETURN_TYPES = ("INT",)
     RETURN_NAMES = ("seed",)
     FUNCTION = "distribute"
     CATEGORY = "deadline"
-    
+
     def distribute(self, seed, task_id=0, batch_mode=False):
-        """
-        Distribute seeds across Deadline tasks.
-        
-        Args:
-            seed: Base seed value
-            task_id: Current task ID (injected by Deadline)
-            batch_mode: Whether this is running in batch mode
-        """
-        # Ensure task_id is an integer
         try:
             task_id = int(task_id)
-        except (ValueError, TypeError):
+        except (TypeError, ValueError):
             task_id = 0
-            
-        if not batch_mode or task_id == 0:
-            # First task or not in batch mode: pass through original seed
-            print(f"Deadline Seed: Task {task_id} using original seed {seed}")
-            return (seed,)
-        else:
-            # Subsequent tasks: add offset based on task ID
-            new_seed = seed + task_id
-            print(f"Deadline Seed: Task {task_id} using modified seed {new_seed} (original: {seed})")
-            return (new_seed,)
+        seed = int(seed)
+        if batch_mode and task_id:
+            return (seed + task_id,)
+        return (seed,)
 
-# Node implementation
+
 class DeadlineSubmitNode:
-    """Submit the current ComfyUI workflow to Thinkbox Deadline"""
-    
     @classmethod
     def INPUT_TYPES(cls):
         pools = cls._get_deadline_pools()
         groups = cls._get_deadline_groups()
-        
         return {
             "required": {
-                "workflow_file": ("STRING", {
-                    "default": "", 
-                    "multiline": False, 
-                    "placeholder": "(Optional) Override if auto-detect is OFF"
-                }),
-                "auto_detect_workflow": ("BOOLEAN", {
-                    "default": True, 
-                    "label_on": "Use current (recommended)", 
-                    "label_off": "Use 'workflow_file' input"
+                "output_directory": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "Farm-visible output directory",
                 }),
                 "batch_count": ("INT", {
-                    "default": NodeDefaults.BATCH_COUNT, 
-                    "min": 1, 
-                    "max": NodeDefaults.MAX_BATCH_COUNT, 
-                    "step": 1
+                    "default": NodeDefaults.BATCH_COUNT,
+                    "min": 1,
+                    "max": NodeDefaults.MAX_BATCH_COUNT,
+                    "step": 1,
                 }),
                 "chunk_size": ("INT", {
-                    "default": NodeDefaults.CHUNK_SIZE, 
-                    "min": 1, 
-                    "max": NodeDefaults.MAX_CHUNK_SIZE, 
-                    "step": 1
+                    "default": NodeDefaults.CHUNK_SIZE,
+                    "min": 1,
+                    "max": NodeDefaults.MAX_CHUNK_SIZE,
+                    "step": 1,
                 }),
-
                 "priority": ("INT", {
-                    "default": NodeDefaults.PRIORITY, 
-                    "min": 0, 
-                    "max": NodeDefaults.MAX_PRIORITY
+                    "default": NodeDefaults.PRIORITY,
+                    "min": 0,
+                    "max": NodeDefaults.MAX_PRIORITY,
                 }),
                 "pool": (pools, {"default": NodeDefaults.POOL}),
                 "group": (groups, {"default": NodeDefaults.GROUP}),
                 "job_name": ("STRING", {"default": NodeDefaults.JOB_NAME}),
-                "bypass": ("BOOLEAN", {"default": False}),
-                "skip_local_execution": ("BOOLEAN", {
-                    "default": True, 
-                    "label_on": "Submit Only", 
-                    "label_off": "Submit and Run Locally"
-                }),
             },
             "optional": {
-                "output_directory": ("STRING", {
-                    "default": "", 
-                    "multiline": False, 
-                    "placeholder": "(Optional) Output directory on worker"
-                }),
                 "comment": ("STRING", {"default": ""}),
                 "department": ("STRING", {"default": ""}),
-
             },
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
-            }
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -551,117 +446,210 @@ class DeadlineSubmitNode:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        """Return a unique value each time to force execution"""
-        return f"deadline_submit_{time.time()}"
+        return f"deadline_submit_{time.time()}_{uuid.uuid4()}"
 
     @classmethod
     def _get_deadline_pools(cls) -> List[str]:
-        """Get available Deadline pools"""
         try:
-            result = DeadlineCommandHelper.call_deadline_command(["-pools"], hide_window=True)
-            pools = [line.strip() for line in result.splitlines() if line.strip()]
-            return pools if pools else [NodeDefaults.POOL]
-        except Exception as e:
-            print(f"Deadline Submission: Error getting Deadline pools: {e}")
+            output = DeadlineCommandHelper.call_deadline_command(["-pools"])
+            pools = [line.strip() for line in output.splitlines() if line.strip()]
+            return pools or [NodeDefaults.POOL]
+        except Exception as exc:
+            print(f"Deadline Submission: Could not query Deadline pools: {exc}")
             return [NodeDefaults.POOL]
 
     @classmethod
     def _get_deadline_groups(cls) -> List[str]:
-        """Get available Deadline groups"""
         try:
-            result = DeadlineCommandHelper.call_deadline_command(["-groups"], hide_window=True)
-            groups = [line.strip() for line in result.splitlines() if line.strip()]
-            return groups if groups else [NodeDefaults.GROUP]
-        except Exception as e:
-            print(f"Deadline Submission: Error getting Deadline groups: {e}")
+            output = DeadlineCommandHelper.call_deadline_command(["-groups"])
+            groups = [line.strip() for line in output.splitlines() if line.strip()]
+            return groups or [NodeDefaults.GROUP]
+        except Exception as exc:
+            print(f"Deadline Submission: Could not query Deadline groups: {exc}")
             return [NodeDefaults.GROUP]
 
-    def submit_to_deadline(self, workflow_file, auto_detect_workflow, batch_count, chunk_size, 
-                         priority, pool, group, job_name, bypass, 
-                         skip_local_execution=True, output_directory="", comment="", department="", 
-                         prompt=None, extra_pnginfo=None):
-        """Submit the workflow to Deadline for rendering"""
-        if bypass:
-            print("Deadline Submission: Bypass enabled. Submission skipped.")
-            return ("Bypassed",)
-            
-        print(f"Deadline Submission: Node execution triggered. Auto-detect: {auto_detect_workflow}")
-        
+    def submit_to_deadline(
+        self,
+        output_directory,
+        batch_count,
+        chunk_size,
+        priority,
+        pool,
+        group,
+        job_name,
+        comment="",
+        department="",
+        prompt=None,
+        extra_pnginfo=None,
+        **_legacy_inputs,
+    ):
         try:
-            # Get workflow data
-            workflow_data = self._get_workflow_data(auto_detect_workflow, workflow_file, prompt)
-            
-            # Prepare workflow for submission
-            prepared_workflow = WorkflowProcessor.prepare_workflow_for_submission(workflow_data)
-            
-            # Create job configuration
-            job_config = self._create_job_config(
-                job_name, priority, pool, group, batch_count, chunk_size,
-                output_directory, comment, department
-            )
-            
-            # Submit to Deadline
-            submitter = DeadlineJobSubmitter(prepared_workflow, job_config)
-            success, result = submitter.submit_job()
-            
-            if success:
-                if skip_local_execution:
-                    ExecutionInterruptor.interrupt_local_execution()
-                return (result,)
-            else:
-                return (f"Error: {result}",)
-                
-        except Exception as e:
-            print(f"Deadline Submission: Error during submission: {e}")
-            return (f"Error: {str(e)}",)
+            output_directory = self._prepare_output_directory(output_directory)
+            batch_count = max(1, int(batch_count))
+            chunk_size = max(1, min(int(chunk_size), batch_count))
+            submission_id = uuid.uuid4().hex[:12]
 
-    def _get_workflow_data(self, auto_detect_workflow: bool, workflow_file: str, prompt) -> Dict:
-        """Get workflow data from either auto-detection or file"""
-        if auto_detect_workflow:
-            print("Deadline Submission: Auto-detect ON. Checking for workflow...")
-            
             if prompt is None:
-                raise Exception("ComfyUI did not inject PROMPT parameter")
-                
-            print("Deadline Submission: Found workflow from ComfyUI's PROMPT parameter injection")
-            return prompt
-        else:
-            print(f"Deadline Submission: Auto-detect OFF. Using specified workflow_file: '{workflow_file}'.")
-            user_workflow_path = workflow_file.strip()
-            
-            if not user_workflow_path or not os.path.exists(user_workflow_path):
-                raise Exception(f"Specified workflow file not found: '{user_workflow_path}'")
-                
+                raise ValueError("ComfyUI did not inject the current API prompt.")
+
+            worker_prompt = WorkflowProcessor.prepare_for_worker(prompt)
+            stager = InputAssetStager(output_directory, job_name, submission_id)
+            input_dir, manifest_file, assets = stager.stage_referenced_assets(worker_prompt)
+            self._rewrite_prompt_asset_references(worker_prompt, assets)
+            standard_workflow = self._extract_standard_workflow(extra_pnginfo)
+            self._rewrite_standard_workflow_assets(standard_workflow, assets)
+
+            job_config = {
+                "submission_id": submission_id,
+                "job_name": job_name.strip() or NodeDefaults.JOB_NAME,
+                "priority": int(priority),
+                "pool": pool,
+                "group": group,
+                "batch_count": batch_count,
+                "chunk_size": chunk_size,
+                "output_directory": output_directory,
+                "input_directory": input_dir,
+                "input_manifest": manifest_file,
+                "standard_workflow": standard_workflow,
+                "comment": comment,
+                "department": department,
+            }
+
+            submitter = DeadlineJobSubmitter(worker_prompt, job_config)
+            success, result = submitter.submit_job()
+            if not success:
+                raise RuntimeError(result)
+
+            print(f"Deadline Submission: Submitted job {result} with {batch_count} variation(s), chunk size {chunk_size}, {len(assets)} staged asset(s).")
+            return (result,)
+        except Exception as exc:
+            print(f"Deadline Submission: Error during submission: {exc}")
+            raise
+
+    def _rewrite_prompt_asset_references(self, prompt: Dict[str, Any], assets: List[Dict[str, Any]]) -> None:
+        staged_by_original = self._asset_map(assets, "staged_relative_path")
+        if not staged_by_original:
+            return
+
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+
+            class_type = node.get("class_type", "")
+            for field_name in INPUT_LOADER_FIELDS.get(class_type, ()):
+                value = inputs.get(field_name)
+                normalized = self._normalize_asset_reference(value)
+                if normalized in staged_by_original:
+                    inputs[field_name] = staged_by_original[normalized]
+
+            for field_name, value in list(inputs.items()):
+                normalized = self._normalize_asset_reference(value)
+                if normalized in staged_by_original:
+                    inputs[field_name] = staged_by_original[normalized]
+
+    def _rewrite_standard_workflow_assets(self, workflow: Optional[Dict[str, Any]], assets: List[Dict[str, Any]]) -> None:
+        staged_absolute_by_original = self._asset_map(assets, "destination")
+        if not workflow or not staged_absolute_by_original:
+            return
+
+        nodes = workflow.get("nodes", [])
+        if not isinstance(nodes, list):
+            return
+
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            widgets = node.get("widgets_values")
+            if not isinstance(widgets, list):
+                continue
+
+            for index, value in enumerate(widgets):
+                normalized = self._normalize_asset_reference(value)
+                if normalized in staged_absolute_by_original:
+                    widgets[index] = staged_absolute_by_original[normalized]
+
+    def _asset_map(self, assets: List[Dict[str, Any]], target_key: str) -> Dict[str, str]:
+        mapping = {}
+        for asset in assets:
+            original = self._normalize_asset_reference(asset.get("original_relative_path"))
+            target = asset.get(target_key)
+            if original and target:
+                mapping[original] = target
+        return mapping
+
+    def _normalize_asset_reference(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str) or not value:
+            return None
+        cleaned = re.sub(r"\s+\[(input|output|temp)\]\s*$", "", value.strip())
+        if os.path.isabs(cleaned):
+            return None
+        return os.path.normpath(cleaned.replace("/", os.sep)).replace("\\", "/")
+
+    def _extract_standard_workflow(self, extra_pnginfo: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(extra_pnginfo, dict):
+            return None
+
+        workflow = extra_pnginfo.get("workflow")
+        if isinstance(workflow, dict):
+            return copy.deepcopy(workflow)
+        if isinstance(workflow, str):
             try:
-                with open(user_workflow_path, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                raise Exception(f"Could not read workflow file: {str(e)}")
+                parsed = json.loads(workflow)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None
 
-    def _create_job_config(self, job_name: str, priority: int, pool: str, group: str, 
-                          batch_count: int, chunk_size: int,
-                          output_directory: str, comment: str, department: str) -> Dict:
-        """Create job configuration dictionary"""
-        return {
-            'job_name': job_name,
-            'priority': priority,
-            'pool': pool,
-            'group': group,
-            'batch_count': batch_count,
-            'chunk_size': chunk_size,
-            'output_directory': output_directory,
-            'comment': comment,
-            'department': department
-        }
+    def _prepare_output_directory(self, output_directory: str) -> str:
+        output_directory = (output_directory or "").strip().strip("\"")
+        if not output_directory:
+            raise ValueError("output_directory is required and must be farm-visible.")
 
-# Register the nodes
+        output_directory = os.path.abspath(os.path.expandvars(output_directory))
+        os.makedirs(output_directory, exist_ok=True)
+        if not os.path.isdir(output_directory):
+            raise ValueError(f"Output path is not a directory: {output_directory}")
+        return output_directory
+
+
+def on_prompt(json_data: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = json_data.get("prompt")
+    if not isinstance(prompt, dict):
+        return json_data
+
+    submit_ids = [
+        str(node_id)
+        for node_id, node in prompt.items()
+        if isinstance(node, dict) and node.get("class_type") in DEADLINE_SUBMIT_NODE_TYPES
+    ]
+
+    if submit_ids:
+        json_data["partial_execution_targets"] = submit_ids[:1]
+        if len(submit_ids) > 1:
+            print(f"Deadline Submission: Multiple submit nodes detected; only node {submit_ids[0]} will execute locally.")
+    return json_data
+
+
+def register_on_prompt_handler() -> None:
+    try:
+        import server
+        instance = getattr(getattr(server, "PromptServer", None), "instance", None)
+        if instance and hasattr(instance, "add_on_prompt_handler"):
+            instance.add_on_prompt_handler(on_prompt)
+            print("Deadline Submission: Registered submit-only prompt handler.")
+    except Exception as exc:
+        print(f"Deadline Submission: Could not register prompt handler: {exc}")
+
+
 NODE_CLASS_MAPPINGS = {
     "DeadlineSubmit": DeadlineSubmitNode,
     "DeadlineSeed": DeadlineSeed,
 }
 
-# Add display names for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DeadlineSubmit": "Submit to Deadline",
     "DeadlineSeed": "Deadline Seed",
-} 
+}

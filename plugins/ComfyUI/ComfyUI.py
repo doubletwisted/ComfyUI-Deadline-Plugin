@@ -15,6 +15,8 @@ import urllib.parse
 import traceback
 import random
 import platform
+import copy
+import uuid
 from typing import Tuple
 
 """
@@ -30,7 +32,6 @@ Supports both existing ComfyUI instances and launching new ones.
 DEFAULT_PORT = 8188
 PORT_OFFSET_PER_GPU = 100
 MAX_PORT_SEARCH_RANGE = 100
-DEFAULT_TIMEOUT = 6000  # 100 minutes
 DEFAULT_POLLING_INTERVAL = 10  # seconds
 MAX_SEED_VALUE = 2147483647
 PROGRESS_LOG_INTERVAL = 10  # Log every 10 polls
@@ -102,7 +103,7 @@ class ComfyUI(DeadlinePlugin):
         # Progress handlers
         self.AddStdoutHandlerCallback(r"\s*([0-9]+)%\|.*\|\s*([0-9]+)/([0-9]+).*").HandleCallback += self.HandleStdoutProgressBar
         self.AddStdoutHandlerCallback(r"Progress: ([0-9.]+)%.*").HandleCallback += self.HandleStdoutProgressPercent
-        self.AddStdoutHandlerCallback(r"Prompt executed in ([0-9.]+) seconds").HandleCallback += self.HandleStdoutPromptExecuted
+        # Completion is tracked through /history so Deadline's own timeout policy remains authoritative.
 
     def _initialize_member_variables(self):
         """Initialize all member variables"""
@@ -119,11 +120,18 @@ class ComfyUI(DeadlinePlugin):
         self.progress_value = 0
         self.thread_running = True
         self.custom_output_dir_specified = False
+        self.comfyui_input_dir = ""
+        self.input_manifest_file = ""
+        self.submission_id = ""
+        self.standard_workflow_file = ""
+        self.standard_workflow = None
         self.comfyui_install_path = None
         self.comfyui_path_candidates = []
         
         # Batch processing variables
         self.chunk_size = 1
+        self.batch_count = 1
+        self.assigned_variation_indices = [0]
         self.prompts_executed = 0
         self.batch_mode = False
         
@@ -216,7 +224,7 @@ class ComfyUI(DeadlinePlugin):
     
     def InitializeProcess(self):
         """Initialize process settings"""
-        self.SingleFramesOnly = True
+        self.SingleFramesOnly = False
         self.PluginType = PluginType.Simple 
         self.ProcessPriority = ProcessPriorityClass.BelowNormal
         self.UseProcessTree = True
@@ -282,14 +290,43 @@ class ComfyUI(DeadlinePlugin):
     def _setup_batch_processing(self):
         """Setup batch processing configuration"""
         self.batch_mode = self.GetBooleanPluginInfoEntryWithDefault("BatchMode", False)
+        self.batch_count = int(self.GetPluginInfoEntryWithDefault("BatchCount", "1"))
         if self.batch_mode:
             self.chunk_size = int(self.GetJob().ChunkSize)
-            self.LogInfo(f"Batch mode enabled. Chunk size: {self.chunk_size}")
+            self.assigned_variation_indices = self._get_assigned_variation_indices()
+            self.chunk_size = len(self.assigned_variation_indices)
+            self.LogInfo(f"Batch mode enabled. Assigned variation indices: {self.assigned_variation_indices}")
         else:
             self.chunk_size = 1
+            self.assigned_variation_indices = [0]
             self.LogInfo("Batch mode disabled. Processing single task.")
         
         self.prompts_executed = 0
+
+    def _get_assigned_variation_indices(self):
+        """Return Deadline frame numbers for the current task; frames are variation indices."""
+        chunk_size = max(1, int(self.GetJob().ChunkSize))
+        task_id = int(self.GetCurrentTaskId())
+        start_from_task = task_id * chunk_size
+        end_from_task = min(start_from_task + chunk_size - 1, self.batch_count - 1)
+        indices_from_task = list(range(start_from_task, end_from_task + 1))
+
+        try:
+            start_frame = int(self.GetStartFrame())
+            end_frame = int(self.GetEndFrame())
+            indices = list(range(start_frame, end_frame + 1))
+        except Exception as e:
+            self.LogWarning(f"Could not read Deadline task frame range, using task/chunk math: {e}")
+            indices = indices_from_task
+
+        if len(indices) != len(indices_from_task):
+            self.LogWarning(
+                f"Deadline frame range reported {indices}, but task/chunk math expects "
+                f"{indices_from_task}; using task/chunk math for variation assignment."
+            )
+            indices = indices_from_task
+
+        return [index for index in indices if 0 <= index < self.batch_count] or [0]
 
     def _setup_output_directory(self):
         """Setup output directory configuration"""
@@ -330,6 +367,28 @@ class ComfyUI(DeadlinePlugin):
         if not os.path.exists(self.comfyui_output_dir):
             self._create_directory(self.comfyui_output_dir, "default output")
 
+    def _setup_input_directory(self):
+        """Setup optional staged ComfyUI input directory for default loader nodes."""
+        input_dir = self.GetPluginInfoEntryWithDefault("JobInputDirectory", "").strip()
+        self.input_manifest_file = self.GetPluginInfoEntryWithDefault("InputManifestFile", "").strip()
+        self.submission_id = self.GetPluginInfoEntryWithDefault("SubmissionId", "").strip()
+
+        if not input_dir:
+            self.comfyui_input_dir = ""
+            self.LogInfo("No staged input directory specified; ComfyUI will use its default input folder.")
+            return
+
+        try:
+            input_dir = RepositoryUtils.CheckPathMapping(input_dir)
+        except Exception as e:
+            self.LogWarning(f"Path mapping failed for JobInputDirectory '{input_dir}': {e}")
+
+        self.comfyui_input_dir = os.path.abspath(os.path.expandvars(input_dir))
+        if not os.path.isdir(self.comfyui_input_dir):
+            raise ComfyUIError(f"Staged input directory does not exist: {self.comfyui_input_dir}")
+
+        self.LogInfo(f"ComfyUI will use staged input directory: {self.comfyui_input_dir}")
+
     def _create_directory(self, directory_path: str, description: str):
         """Create a directory with error handling"""
         try:
@@ -361,40 +420,18 @@ class ComfyUI(DeadlinePlugin):
 
     def _determine_final_port(self, base_port: int) -> str:
         """Determine final port to use, checking for existing instances"""
-        # Check if we should force a new instance (for distributed workers)
         worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
-        
-        if force_new_instance or worker_mode or distributed_mode:
-            self.LogInfo("Worker/Distributed mode: Will start new ComfyUI instance (not reusing existing)")
-            self.use_existing_comfyui = False
-            
-            # For workers, use dynamic port allocation to avoid conflicts
-            if worker_mode or distributed_mode:
-                worker_port = self._calculate_worker_port(base_port)
-                self.comfyui_port = self._find_available_port(worker_port)
-                self.LogInfo(f"Worker mode: Using port {self.comfyui_port}")
-            else:
-                self.comfyui_port = self._find_available_port(base_port)
-                self.LogInfo(f"Force new instance: Using port {self.comfyui_port}")
-                
-            self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
-            return self.comfyui_port
-        
-        # Normal batch mode logic
-        self.LogInfo(f"Checking if ComfyUI is already running on port {base_port}")
-        
-        if self._is_port_in_use(base_port):
-            self.LogInfo(f"ComfyUI is already running on port {base_port}, will use existing instance")
-            self.use_existing_comfyui = True
-            self.comfyui_port = str(base_port)
-            self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
-            self.server_started = True
+
+        self.use_existing_comfyui = False
+        if worker_mode or distributed_mode:
+            worker_port = self._calculate_worker_port(base_port)
+            self.comfyui_port = self._find_available_port(worker_port)
+            self.LogInfo(f"Worker/distributed mode: starting isolated ComfyUI on port {self.comfyui_port}")
         else:
-            self.LogInfo(f"No ComfyUI instance detected on port {base_port}")
-            self.use_existing_comfyui = False
             self.comfyui_port = self._find_available_port(base_port)
-            self.LogInfo(f"Will use port {self.comfyui_port} for ComfyUI")
-            self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+            self.LogInfo(f"Normal render mode: starting isolated ComfyUI on port {self.comfyui_port}")
+
+        self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
         
         return self.comfyui_port
 
@@ -427,6 +464,7 @@ class ComfyUI(DeadlinePlugin):
             if not comfyui_path:
                 raise ComfyUIError("ComfyUI installation path could not be resolved.")
             self._setup_output_directory()
+            self._setup_input_directory()
             self._setup_temp_directory()
             self._calculate_comfyui_port()
             self.task_completed = False
@@ -608,6 +646,10 @@ print('Dummy command timeout reached or task completed.')
         else:
             self.LogInfo("Not passing --output-directory to ComfyUI, it will use its default.")
 
+        if self.comfyui_input_dir:
+            args_list.append(f'--input-directory "{self.comfyui_input_dir}"')
+            self.LogInfo(f"Passing --input-directory \"{self.comfyui_input_dir}\" to ComfyUI.")
+
         args = " ".join(args_list)
         self.LogInfo(f"Render Arguments: {args}")
         return args
@@ -756,6 +798,9 @@ print('Dummy command timeout reached or task completed.')
     def _set_deadline_environment_variables(self):
         """Set Deadline-specific environment variables for ComfyUI process"""
         try:
+            os.environ['GIT_PYTHON_REFRESH'] = 'quiet'
+            self.LogInfo("Set GIT_PYTHON_REFRESH=quiet so workers do not require git.exe for ComfyUI-Manager startup")
+
             # Get the actual Deadline worker name and set it as environment variable
             slave_name = self.GetSlaveName()
             if slave_name:
@@ -831,21 +876,19 @@ print('Dummy command timeout reached or task completed.')
         try:
             workflow_data = self._load_workflow_from_file(workflow_file)
             workflow_data = self.validate_workflow(workflow_data)
-            
-            # Inject parameters for DeadlineDistributedSeed nodes
-            deadline_seeds_injected = self.inject_deadline_seed_parameters(workflow_data)
-            
-            # Apply seed manipulation only if no DeadlineDistributedSeed nodes are present
-            if not deadline_seeds_injected:
-                task_id = self.GetCurrentTaskId()
-                seeds_modified = self.modify_workflow_seeds(workflow_data, task_id)
-                
-                if seeds_modified:
-                    self.LogInfo(f"Applied seed manipulation for task ID {task_id}")
+
+            worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+            if worker_mode or distributed_mode:
+                deadline_seeds_injected = self.inject_deadline_seed_parameters(workflow_data)
+                if not deadline_seeds_injected:
+                    task_id = self.GetCurrentTaskId()
+                    seeds_modified = self.modify_workflow_seeds(workflow_data, task_id)
+                    if seeds_modified:
+                        self.LogInfo(f"Applied legacy seed manipulation for distributed task ID {task_id}")
                 else:
-                    self.LogInfo(f"No seed manipulation applied for task ID {task_id}")
+                    self.LogInfo("DeadlineSeed nodes detected for distributed worker workflow")
             else:
-                self.LogInfo("DeadlineSeed nodes detected - skipping automatic seed modification")
+                self.LogInfo("Normal V2 job: seed variation will be applied per queued prompt via DeadlineSeed only")
             
             return workflow_data
         except Exception as e:
@@ -865,12 +908,76 @@ print('Dummy command timeout reached or task completed.')
                 # Fallback to ComfyWorkflowFile if WorkflowFile is not set
                 workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", self.GetDataFilename())
         else:
-            # Normal batch mode
-            workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", self.GetDataFilename())
+            # Normal V2 jobs execute the API prompt, while the first auxiliary file may be the standard UI workflow.
+            workflow_file = self.GetPluginInfoEntryWithDefault("ComfyWorkflowFile", "")
+            if not workflow_file:
+                workflow_file = self.GetDataFilename()
         
-        workflow_file = RepositoryUtils.CheckPathMapping(workflow_file)
+        workflow_file = self._resolve_workflow_file_path(workflow_file)
         self.LogInfo(f"Workflow file setting from plugin info: '{workflow_file}'")
         return workflow_file
+
+    def _resolve_workflow_file_path(self, workflow_file: str) -> str:
+        """Resolve absolute or auxiliary-file-relative workflow paths."""
+        workflow_file = (workflow_file or "").strip().strip('"')
+        if not workflow_file:
+            return ""
+
+        try:
+            mapped = RepositoryUtils.CheckPathMapping(workflow_file)
+        except Exception:
+            mapped = workflow_file
+
+        if os.path.isabs(mapped):
+            return mapped
+
+        candidates = []
+        data_filename = self.GetDataFilename()
+        if data_filename:
+            candidates.append(os.path.join(os.path.dirname(data_filename), mapped))
+
+        try:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), mapped))
+        except Exception:
+            pass
+
+        if self.temp_dir:
+            candidates.append(os.path.join(self.temp_dir, mapped))
+
+        candidates.append(os.path.abspath(mapped))
+
+        for candidate in candidates:
+            try:
+                candidate = RepositoryUtils.CheckPathMapping(candidate)
+            except Exception:
+                pass
+            if os.path.exists(candidate):
+                return candidate
+
+        self.LogWarning(f"Could not resolve relative workflow file '{workflow_file}'. Tried: {candidates}")
+        return candidates[0] if candidates else mapped
+
+    def _load_standard_workflow_metadata(self):
+        """Load the optional UI workflow used for image metadata drag-and-drop."""
+        standard_workflow_file = self.GetPluginInfoEntryWithDefault("StandardWorkflowFile", "").strip()
+        if not standard_workflow_file:
+            self.standard_workflow = None
+            return
+
+        try:
+            standard_workflow_file = self._resolve_workflow_file_path(standard_workflow_file)
+            if not os.path.exists(standard_workflow_file):
+                self.LogWarning(f"Standard workflow metadata file not found: {standard_workflow_file}")
+                self.standard_workflow = None
+                return
+
+            with open(standard_workflow_file, "r") as f:
+                self.standard_workflow = json.load(f)
+            self.standard_workflow_file = standard_workflow_file
+            self.LogInfo(f"Loaded standard workflow metadata: {standard_workflow_file}")
+        except Exception as e:
+            self.standard_workflow = None
+            self.LogWarning(f"Could not load standard workflow metadata: {e}")
 
     def _load_workflow_from_file(self, workflow_file: str) -> dict:
         """Load workflow data from JSON file"""
@@ -1034,7 +1141,11 @@ print('Dummy command timeout reached or task completed.')
             # A matching Triton is not available warning
             "A matching Triton is not available, some optimizations will not be enabled",
             # xformers version warnings
-            "WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations"
+            "WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations",
+            # ComfyUI-Manager imports GitPython on startup, but render workers do not need git.exe.
+            "ImportError: Bad git executable",
+            "ImportError: Failed to initialize: Bad git executable",
+            "Cannot import C:\\AI\\ComfyUI_windows_portable4\\ComfyUI\\custom_nodes\\ComfyUI-Manager module for custom nodes: Failed to initialize: Bad git executable",
         ]
 
         for pattern in non_critical_patterns:
@@ -1068,7 +1179,7 @@ print('Dummy command timeout reached or task completed.')
                 self.FailRender(f"Error connecting to ComfyUI API: {response['status_code']}")
                 return False
                 
-            self.client_id = response['json']().get('client_id', '')
+            self.client_id = f"deadline-{uuid.uuid4().hex}"
             self.LogInfo(f"Got client ID: {self.client_id}")
             return True
         except Exception as e:
@@ -1080,15 +1191,13 @@ print('Dummy command timeout reached or task completed.')
         """Submit workflow to ComfyUI queue"""
         try:
             self._reset_prompt_tracking()
-            
-            # Queue initial prompt
-            if not self._queue_single_prompt(workflow_data):
-                return False
-            
-            # Queue additional prompts for batch mode
-            if self.batch_mode and self.chunk_size > 1:
-                self._queue_batch_prompts(workflow_data)
-            
+
+            for variation_index in self.assigned_variation_indices:
+                prompt_workflow, metadata, workflow_metadata = self._prepare_variation_prompt(workflow_data, variation_index)
+                if not self._queue_prompt(prompt_workflow, metadata, workflow_metadata):
+                    return False
+                time.sleep(0.2)
+
             self.LogInfo(f"Queued total of {len(self.prompt_ids)} prompts: {self.prompt_ids}")
             return True
         except Exception as e:
@@ -1102,9 +1211,19 @@ print('Dummy command timeout reached or task completed.')
         self.completed_prompts = set()
         self.current_tracking_index = 0
 
-    def _queue_single_prompt(self, workflow_data: dict) -> bool:
-        """Queue a single prompt to ComfyUI"""
-        data = {"prompt": workflow_data, "client_id": self.client_id}
+    def _queue_prompt(self, workflow_data: dict, deadline_metadata: dict, workflow_metadata: dict = None) -> bool:
+        """Queue one prepared variation prompt to ComfyUI."""
+        extra_pnginfo = {"deadline": deadline_metadata}
+        if workflow_metadata is not None:
+            extra_pnginfo["workflow"] = workflow_metadata
+
+        data = {
+            "prompt": workflow_data,
+            "client_id": self.client_id,
+            "extra_data": {
+                "extra_pnginfo": extra_pnginfo
+            },
+        }
         response = self.http_request(f"{self.comfyui_api_url}/prompt", method="POST", data=data)
         
         if response['status_code'] != 200:
@@ -1114,55 +1233,73 @@ print('Dummy command timeout reached or task completed.')
         
         self.prompt_id = response['json']()['prompt_id']
         self.prompt_ids.append(self.prompt_id)
-        self.LogInfo(f"Queued prompt with ID: {self.prompt_id}")
+        self.LogInfo(f"Queued variation {deadline_metadata['variation_index']} with prompt ID: {self.prompt_id}")
         self.workflow_submitted = True
         return True
 
-    def _queue_batch_prompts(self, workflow_data: dict):
-        """Queue additional prompts for batch processing"""
-        self.LogInfo(f"Batch mode with chunk size {self.chunk_size}. Queueing additional prompts...")
-        
-        import copy
-        
-        for i in range(1, self.chunk_size):
-            prompt_workflow = copy.deepcopy(workflow_data)
-            
-            # Check if workflow has DeadlineSeed nodes
-            has_deadline_seeds = any(
-                node.get("class_type") == "DeadlineSeed" 
-                for node in prompt_workflow.values() 
-                if isinstance(node, dict)
-            )
-            
-            if has_deadline_seeds:
-                # Update task_id for DeadlineSeed nodes (chunk-local indexing)
-                for node_id, node in prompt_workflow.items():
-                    if isinstance(node, dict) and node.get("class_type") == "DeadlineSeed":
-                        if "inputs" not in node:
-                            node["inputs"] = {}
-                        # Use i as the offset for chunks within the same task
-                        base_task_id = int(node["inputs"].get("task_id", 0))
-                        node["inputs"]["task_id"] = base_task_id + i
-                        self.LogInfo(f"Updated DeadlineSeed node {node_id} task_id to {base_task_id + i}")
-            else:
-                # Modify seeds using the old method
-                if self.GetPluginInfoEntryWithDefault("SeedMode", "fixed") != "fixed":
-                    self.modify_workflow_seeds(prompt_workflow, i)
-                    self.LogInfo(f"Modified seeds for additional prompt {i}")
-            
-            # Queue the workflow
-            data = {"prompt": prompt_workflow, "client_id": self.client_id}
-            response = self.http_request(f"{self.comfyui_api_url}/prompt", method="POST", data=data)
-            
-            if response['status_code'] != 200:
-                self.LogWarning(f"Error queuing additional prompt {i}: {response['text']}")
-                break
-                
-            prompt_id = response['json']()['prompt_id']
-            self.prompt_ids.append(prompt_id)
-            self.LogInfo(f"Queued additional prompt {i} with ID: {prompt_id}")
-            
-            time.sleep(0.5)  # Small delay between submissions
+    def _prepare_variation_prompt(self, workflow_data: dict, variation_index: int):
+        """Deep-copy and rewrite DeadlineSeed nodes for one global variation index."""
+        prompt_workflow = copy.deepcopy(workflow_data)
+        seeds = []
+
+        for node_id, node in prompt_workflow.items():
+            if not isinstance(node, dict) or node.get("class_type") != "DeadlineSeed":
+                continue
+            inputs = node.setdefault("inputs", {})
+            base_seed = int(inputs.get("seed", 0))
+            actual_seed = base_seed + int(variation_index)
+            inputs["seed"] = actual_seed
+            inputs["task_id"] = 0
+            inputs["batch_mode"] = False
+            seeds.append({
+                "node_id": str(node_id),
+                "base_seed": base_seed,
+                "actual_seed": actual_seed,
+            })
+            self.LogInfo(f"DeadlineSeed node {node_id}: base {base_seed}, variation {variation_index}, actual {actual_seed}")
+
+        metadata = {
+            "job_id": getattr(self.GetJob(), "JobId", ""),
+            "task_id": str(self.GetCurrentTaskId()),
+            "variation_index": int(variation_index),
+            "submission_id": self.submission_id,
+            "output_directory": self.comfyui_output_dir,
+            "input_directory": self.comfyui_input_dir,
+            "input_manifest": self.input_manifest_file,
+            "seeds": seeds,
+        }
+        if seeds:
+            metadata["base_seed"] = seeds[0]["base_seed"]
+            metadata["actual_seed"] = seeds[0]["actual_seed"]
+
+        workflow_metadata = self._prepare_standard_workflow_metadata(seeds)
+        return prompt_workflow, metadata, workflow_metadata
+
+    def _prepare_standard_workflow_metadata(self, seeds: list):
+        """Patch the UI workflow metadata so dropped output images reopen the actual variation."""
+        if self.standard_workflow is None:
+            return None
+
+        workflow_metadata = copy.deepcopy(self.standard_workflow)
+        seed_by_node_id = {
+            str(seed_info["node_id"]): seed_info["actual_seed"]
+            for seed_info in seeds
+        }
+
+        nodes = workflow_metadata.get("nodes", [])
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_id = str(node.get("id", ""))
+                node_type = node.get("type") or node.get("class_type")
+                if node_type != "DeadlineSeed" or node_id not in seed_by_node_id:
+                    continue
+                widgets = node.get("widgets_values")
+                if isinstance(widgets, list) and widgets:
+                    widgets[0] = seed_by_node_id[node_id]
+
+        return workflow_metadata
 
     def process_history_data(self, history_data: dict) -> bool:
         """Process history data and update task status"""
@@ -1221,16 +1358,7 @@ print('Dummy command timeout reached or task completed.')
         self.SetProgress(100)
         self.SetStatusMessage("Finished Render")
         self.task_completed = True
-        
-        # Check if we're in distributed worker mode
-        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
-        
-        if worker_mode and distributed_mode:
-            self.LogInfo("Distributed worker mode: Registration completed, entering keep-alive mode")
-            self._enter_distributed_keep_alive_mode()
-        else:
-            self.signal_task_completion()
-            self.LogInfo(f"All {self.chunk_size} prompts in chunk completed, task marked as complete")
+        self.LogInfo(f"All {self.chunk_size} prompt(s) in this task completed")
 
     def _move_to_next_prompt(self):
         """Move to tracking the next prompt"""
@@ -1263,17 +1391,8 @@ print('Dummy command timeout reached or task completed.')
         """Handle prompt execution errors"""
         error_msg = status.get('error', 'Unknown error')
         self.LogWarning(f"ComfyUI reported error for prompt {self.prompt_id}: {error_msg}")
-        
-        if self.chunk_size > 1:
-            # Continue with remaining prompts in batch
-            self.LogWarning(f"Continuing with remaining prompts in chunk")
-            self.completed_prompts.add(self.prompt_id)
-            self._move_to_next_prompt()
-            return False
-        else:
-            # Single prompt mode, fail the task
-            self.FailRender(f"ComfyUI workflow failed: {error_msg}")
-            return True
+        self.FailRender(f"ComfyUI workflow failed: {error_msg}")
+        return True
 
     def _update_execution_progress(self, progress: float):
         """Update progress from execution information"""
@@ -1320,7 +1439,6 @@ print('Dummy command timeout reached or task completed.')
 
     def monitor_workflow_execution(self) -> bool:
         """Poll history endpoint and wait for workflow completion"""
-        start_time = time.time()
         self.LogInfo(f"Beginning to monitor workflow execution for chunk size {self.chunk_size}")
         self.LogInfo(f"Monitoring prompts in this order: {self.prompt_ids}")
         
@@ -1329,9 +1447,9 @@ print('Dummy command timeout reached or task completed.')
         
         poll_count = 0
         
-        while time.time() - start_time < DEFAULT_TIMEOUT and self.thread_running:
+        while self.thread_running:
             if self.task_completed:
-                self.LogInfo("Task already marked as complete by stdout handler")
+                self.LogInfo("Task already marked as complete")
                 
                 # Check if we're in distributed worker mode
                 worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
@@ -1351,12 +1469,6 @@ print('Dummy command timeout reached or task completed.')
             
             poll_count += 1
             time.sleep(DEFAULT_POLLING_INTERVAL)
-        
-        # Check for timeout
-        if not self.task_completed and time.time() - start_time >= DEFAULT_TIMEOUT:
-            self.LogWarning(f"Timeout waiting for workflow to complete after {DEFAULT_TIMEOUT} seconds")
-            self.FailRender(f"Timeout waiting for workflow to complete")
-            return False
         
         if self.task_completed:
             # Check if we're in distributed worker mode
@@ -1460,6 +1572,8 @@ print('Dummy command timeout reached or task completed.')
             workflow_data = self.load_and_validate_workflow()
             if not workflow_data:
                 return
+
+            self._load_standard_workflow_metadata()
             
             if not self.initialize_api_connection():
                 return
@@ -1472,4 +1586,4 @@ print('Dummy command timeout reached or task completed.')
         except Exception as e:
             self.LogWarning(f"Error during workflow submission: {e}")
             traceback.print_exc()
-            self.FailRender(f"Error during workflow submission: {str(e)}") 
+            self.FailRender(f"Error during workflow submission: {str(e)}")

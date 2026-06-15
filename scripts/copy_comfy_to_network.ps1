@@ -7,6 +7,8 @@ $source = "C:\AI\ComfyUI_windows_portable4"
 
 $destination = "X:\AI\ComfyUI_windows_portable4"
 
+$publishLock = "$destination.sync_in_progress"
+
 $logDir = "X:\scripts\copy_comfy_to_network_logs"
 
 # Get current date and time in YYYY-MM-DD_HH-MM-SS format
@@ -27,6 +29,15 @@ if (!(Test-Path -Path $logDir)) {
 
 Start-Transcript -Path $logFile -Append
 
+function Assert-RobocopySuccess {
+    param([string]$Operation)
+
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ge 8) {
+        throw "Robocopy failed during $Operation with exit code $exitCode"
+    }
+}
+
 # Create destination if it doesn't exist
 
 if (!(Test-Path -Path $destination)) {
@@ -35,6 +46,10 @@ if (!(Test-Path -Path $destination)) {
 
 }
 
+Set-Content -Path $publishLock -Value "Publishing from $env:COMPUTERNAME at $(Get-Date -Format o)" -Force
+
+try {
+
 # --- Extra exclusions for robocopy ---
 
 $extraExcludeDirs = @()
@@ -42,13 +57,21 @@ $extraExcludeDirs = @()
 # Precise absolute excludes for specific Triton and SageAttention folders
 $extraExcludeDirs += "$source\python_embeded\Lib\site-packages\triton"
 $extraExcludeDirs += "$source\python_embeded\Lib\site-packages\triton-3.2.0.dist-info"
+$extraExcludeDirs += "$source\python_embeded\Lib\site-packages\sageattention"
+$extraExcludeDirs += "$source\python_embeded\Lib\site-packages\sageattention-2.1.1.dist-info"
 $extraExcludeDirs += "$source\SageAttention"
 
-$allExcludeDirs = @('__pycache__', 'output', 'input') + $extraExcludeDirs
+$allExcludeDirs = @(
+    '__pycache__',
+    "$source\ComfyUI\input",
+    "$source\ComfyUI\output",
+    "$source\ComfyUI\temp"
+) + $extraExcludeDirs
 
 # Main robocopy with all exclusions, mirror mode, and junction exclusion
 
 robocopy $source $destination /MIR /XD $allExcludeDirs /XF "*.md5" "*.log" "*.tmp" /XJ /R:5 /W:5 /NFL /NDL /NP
+Assert-RobocopySuccess "main mirror"
 
 # Copy the specific example.png file
 
@@ -66,7 +89,7 @@ if (Test-Path $exampleFile) {
 
     }
 
-    Copy-Item $exampleFile $inputDestination -Force
+    Copy-Item $exampleFile $inputDestination -Force -ErrorAction Stop
 
 }
 
@@ -79,12 +102,14 @@ if (Test-Path $inputSource) {
     # Copy only subdirectories and their contents from input folder
 
     robocopy $inputSource $inputDestination /S /XF * /R:2 /W:2 /NFL /NDL /NP
+    Assert-RobocopySuccess "input folder structure"
 
     # Then copy contents of subdirectories
 
     Get-ChildItem $inputSource -Directory | ForEach-Object {
 
         robocopy $_.FullName "$inputDestination\$($_.Name)" /E /R:2 /W:2 /NFL /NDL /NP
+        Assert-RobocopySuccess "input subfolder $($_.FullName)"
 
     }
 
@@ -101,6 +126,7 @@ if (Test-Path $outputSource) {
     # Copy directory structure without files
 
     robocopy $outputSource $outputDestination /E /XF * /R:2 /W:2 /NFL /NDL /NP
+    Assert-RobocopySuccess "output folder structure"
 
 }
 
@@ -112,6 +138,13 @@ Write-Host "- Copied all input subfolders with contents"
 
 Write-Host "- Created empty output folder structure"
 
-# Stop transcript
+}
+finally {
 
-Stop-Transcript
+    Remove-Item -LiteralPath $publishLock -Force -ErrorAction SilentlyContinue
+
+    # Stop transcript
+
+    Stop-Transcript
+
+}
