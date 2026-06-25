@@ -39,6 +39,12 @@ MEDIA_EXTENSIONS = {
 }
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 class NodeDefaults:
     JOB_NAME = "ComfyUI via Deadline"
     PRIORITY = 50
@@ -362,6 +368,11 @@ class DeadlineJobSubmitter:
 
 
 class DeadlineSeed:
+    """
+    Deadline-compatible seed node.
+    Batch mode varies by Deadline task ID; distributed mode varies by worker ID.
+    """
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -376,6 +387,8 @@ class DeadlineSeed:
             "hidden": {
                 "task_id": ("INT", {"default": 0}),
                 "batch_mode": ("BOOLEAN", {"default": False}),
+                "is_worker": ("BOOLEAN", {"default": False}),
+                "worker_id": ("STRING", {"default": ""}),
             },
         }
 
@@ -384,15 +397,32 @@ class DeadlineSeed:
     FUNCTION = "distribute"
     CATEGORY = "deadline"
 
-    def distribute(self, seed, task_id=0, batch_mode=False):
-        try:
-            task_id = int(task_id)
-        except (TypeError, ValueError):
-            task_id = 0
+    def distribute(self, seed, task_id=0, batch_mode=False, is_worker=False, worker_id=""):
         seed = int(seed)
-        if batch_mode and task_id:
+
+        if _coerce_bool(batch_mode):
+            try:
+                task_id = int(task_id)
+            except (TypeError, ValueError):
+                task_id = 0
             return (seed + task_id,)
+
+        if _coerce_bool(is_worker):
+            try:
+                worker_id = str(worker_id)
+                if worker_id.startswith("worker_"):
+                    worker_index = int(worker_id.split("_")[1])
+                else:
+                    worker_index = int(worker_id)
+                return (seed + worker_index + 1,)
+            except (TypeError, ValueError, IndexError):
+                return (seed,)
+
         return (seed,)
+
+
+class LegacyDeadlineSeedAlias(DeadlineSeed):
+    DEPRECATED = True
 
 
 class DeadlineSubmitNode:
@@ -647,9 +677,13 @@ def register_on_prompt_handler() -> None:
 NODE_CLASS_MAPPINGS = {
     "DeadlineSubmit": DeadlineSubmitNode,
     "DeadlineSeed": DeadlineSeed,
+    "DeadlineDistributedSeed": LegacyDeadlineSeedAlias,
+    "DistributedSeed": LegacyDeadlineSeedAlias,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DeadlineSubmit": "Submit to Deadline",
     "DeadlineSeed": "Deadline Seed",
+    "DeadlineDistributedSeed": "Deadline Seed",
+    "DistributedSeed": "Deadline Seed",
 }

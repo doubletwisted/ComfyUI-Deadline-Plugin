@@ -1,0 +1,169 @@
+# Rename this to extra_model_paths.yaml and ComfyUI will load it
+# config for comfyui with network-first (X), then D, then C
+
+comfyui:
+  # Network base path - centralized storage location
+  base_path: X:/AI
+  # You can use is_default to mark that these folders should be listed first, and used as the default dirs for eg downloads
+  is_default: true
+
+  # Core model types
+  checkpoints: |
+    models/checkpoints
+    D:/AI/models/checkpoints
+    C:/AI/models/checkpoints
+
+  clip: |
+    models/clip
+    D:/AI/models/clip
+    C:/AI/models/clip
+
+  clip_vision: |
+    models/clip_vision
+    D:/AI/models/clip_vision
+    C:/AI/models/clip_vision
+
+  configs: |
+    models/configs
+    D:/AI/models/configs
+    C:/AI/models/configs
+
+  controlnet: |
+    models/controlnet
+    D:/AI/models/controlnet
+    C:/AI/models/controlnet
+
+  diffusion_models: |
+    models/diffusion_models
+    models/unet
+    D:/AI/models/diffusion_models
+    D:/AI/models/unet
+    C:/AI/models/diffusion_models
+    C:/AI/models/unet
+
+  embeddings: |
+    models/embeddings
+    D:/AI/models/embeddings
+    C:/AI/models/embeddings
+
+  loras: |
+    models/loras
+    D:/AI/models/loras
+    C:/AI/models/loras
+
+  upscale_models: |
+    models/upscale_models
+    D:/AI/models/upscale_models
+    C:/AI/models/upscale_models
+
+  vae: |
+    models/vae
+    D:/AI/models/vae
+    C:/AI/models/vae
+
+  style_models: |
+    models/style_models
+    D:/AI/models/style_models
+    C:/AI/models/style_models
+
+  text_encoders: |
+    models/text_encoders
+    D:/AI/models/text_encoders
+    C:/AI/models/text_encoders
+
+  unet: |
+    models/unet
+    D:/AI/models/unet
+    C:/AI/models/unet
+
+  # Specialized model types
+  annotators: |
+    models/annotators
+    D:/AI/models/annotators
+    C:/AI/models/annotators
+
+  depth: |
+    models/depth
+    D:/AI/models/depth
+    C:/AI/models/depth
+
+  depthanything: |
+    models/depthanything
+    D:/AI/models/depthanything
+    C:/AI/models/depthanything
+
+  depthcrafter: |
+    models/depthcrafter
+    D:/AI/models/depthcrafter
+    C:/AI/models/depthcrafter
+
+  diffusers: |
+    models/diffusers
+    D:/AI/models/diffusers
+    C:/AI/models/diffusers
+
+  gligen: |
+    models/gligen
+    D:/AI/models/gligen
+    C:/AI/models/gligen
+
+  grounding-dino: |
+    models/grounding-dino
+    D:/AI/models/grounding-dino
+    C:/AI/models/grounding-dino
+
+  hypernetworks: |
+    models/hypernetworks
+    D:/AI/models/hypernetworks
+    C:/AI/models/hypernetworks
+
+  ipadapter: |
+    models/ipadapter
+    D:/AI/models/ipadapter
+    C:/AI/models/ipadapter
+
+  llm_gguf: |
+    models/llm_gguf
+    D:/AI/models/llm_gguf
+    C:/AI/models/llm_gguf
+
+  photomaker: |
+    models/photomaker
+    D:/AI/models/photomaker
+    C:/AI/models/photomaker
+
+  sam: |
+    models/sam
+    D:/AI/models/sam
+    C:/AI/models/sam
+
+  sam2: |
+    models/sam2
+    D:/AI/models/sam2
+    C:/AI/models/sam2
+
+  sams: |
+    models/sams
+    D:/AI/models/sams
+    C:/AI/models/sams
+
+  ultralytics: |
+    models/ultralytics
+    D:/AI/models/ultralytics
+    C:/AI/models/ultralytics
+
+  vae_approx: |
+    models/vae_approx
+    D:/AI/models/vae_approx
+    C:/AI/models/vae_approx
+
+  # Additional paths for specialized models
+  xlabs: |
+    models/xlabs
+    D:/AI/models/xlabs
+    C:/AI/models/xlabs
+    
+  SEEDVR2: |
+    models/SEEDVR2
+    D:/AI/models/SEEDVR2
+    C:/AI/models/SEEDVR2

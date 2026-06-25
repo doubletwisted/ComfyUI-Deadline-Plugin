@@ -39,6 +39,7 @@ FILE_WRITE_DELAY = 2  # seconds to wait for files to be written
 
 # Seed parameter names to search for in workflows
 SEED_PARAMETER_NAMES = ["seed", "noise_seed", "value"]
+DEADLINE_SEED_NODE_TYPES = {"DeadlineSeed", "DeadlineDistributedSeed", "DistributedSeed"}
 
 # Output node types that indicate the workflow will produce output
 OUTPUT_NODE_TYPES = ["SaveImage", "PreviewImage", "SaveVideo"]
@@ -831,7 +832,7 @@ print('Dummy command timeout reached or task completed.')
 
     def inject_deadline_seed_parameters(self, workflow_data: dict) -> bool:
         """
-        Inject task_id and batch_mode into DeadlineDistributedSeed nodes.
+        Inject task_id and batch_mode into Deadline seed nodes.
         
         Args:
             workflow_data: The workflow data
@@ -848,7 +849,8 @@ print('Dummy command timeout reached or task completed.')
                 if not isinstance(node, dict):
                     continue
                     
-                if node.get("class_type") == "DeadlineSeed":
+                node_type = node.get("class_type")
+                if node_type in DEADLINE_SEED_NODE_TYPES:
                     if "inputs" not in node:
                         node["inputs"] = {}
                     
@@ -856,7 +858,7 @@ print('Dummy command timeout reached or task completed.')
                     node["inputs"]["task_id"] = task_id
                     node["inputs"]["batch_mode"] = batch_mode
                     
-                    self.LogInfo(f"Injected task_id={task_id}, batch_mode={batch_mode} into DeadlineSeed node {node_id}")
+                    self.LogInfo(f"Injected task_id={task_id}, batch_mode={batch_mode} into {node_type} node {node_id}")
                     nodes_modified = True
             
             return nodes_modified
@@ -886,9 +888,9 @@ print('Dummy command timeout reached or task completed.')
                     if seeds_modified:
                         self.LogInfo(f"Applied legacy seed manipulation for distributed task ID {task_id}")
                 else:
-                    self.LogInfo("DeadlineSeed nodes detected for distributed worker workflow")
+                    self.LogInfo("Deadline seed nodes detected for distributed worker workflow")
             else:
-                self.LogInfo("Normal V2 job: seed variation will be applied per queued prompt via DeadlineSeed only")
+                self.LogInfo("Normal V2 job: seed variation will be applied per queued prompt via Deadline seed nodes only")
             
             return workflow_data
         except Exception as e:
@@ -1238,13 +1240,14 @@ print('Dummy command timeout reached or task completed.')
         return True
 
     def _prepare_variation_prompt(self, workflow_data: dict, variation_index: int):
-        """Deep-copy and rewrite DeadlineSeed nodes for one global variation index."""
+        """Deep-copy and rewrite Deadline seed nodes for one global variation index."""
         prompt_workflow = copy.deepcopy(workflow_data)
         seeds = []
 
         for node_id, node in prompt_workflow.items():
-            if not isinstance(node, dict) or node.get("class_type") != "DeadlineSeed":
+            if not isinstance(node, dict) or node.get("class_type") not in DEADLINE_SEED_NODE_TYPES:
                 continue
+            node_type = node.get("class_type")
             inputs = node.setdefault("inputs", {})
             base_seed = int(inputs.get("seed", 0))
             actual_seed = base_seed + int(variation_index)
@@ -1256,7 +1259,7 @@ print('Dummy command timeout reached or task completed.')
                 "base_seed": base_seed,
                 "actual_seed": actual_seed,
             })
-            self.LogInfo(f"DeadlineSeed node {node_id}: base {base_seed}, variation {variation_index}, actual {actual_seed}")
+            self.LogInfo(f"{node_type} node {node_id}: base {base_seed}, variation {variation_index}, actual {actual_seed}")
 
         metadata = {
             "job_id": getattr(self.GetJob(), "JobId", ""),
@@ -1293,7 +1296,7 @@ print('Dummy command timeout reached or task completed.')
                     continue
                 node_id = str(node.get("id", ""))
                 node_type = node.get("type") or node.get("class_type")
-                if node_type != "DeadlineSeed" or node_id not in seed_by_node_id:
+                if node_type not in DEADLINE_SEED_NODE_TYPES or node_id not in seed_by_node_id:
                     continue
                 widgets = node.get("widgets_values")
                 if isinstance(widgets, list) and widgets:
