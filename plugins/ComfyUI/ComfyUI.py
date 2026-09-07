@@ -639,6 +639,13 @@ print('Dummy command timeout reached or task completed.')
 
 
         args_list.append("--disable-auto-launch")
+        if self.GetBooleanPluginInfoEntryWithDefault("DisableDynamicVRAM", False):
+            args_list.append("--disable-dynamic-vram")
+        reserve_vram = float(self.GetPluginInfoEntryWithDefault("ReserveVRAM", "0"))
+        if not 0 <= reserve_vram <= 64:
+            raise ValueError("ReserveVRAM must be between 0 and 64 GB")
+        if reserve_vram > 0:
+            args_list.append(f"--reserve-vram {reserve_vram:g}")
 
         # Add output directory if custom one was specified
         if self.custom_output_dir_specified and self.comfyui_output_dir:
@@ -872,7 +879,7 @@ print('Dummy command timeout reached or task completed.')
         workflow_file = self._get_workflow_file_path()
         if not workflow_file or not os.path.exists(workflow_file):
             self.LogWarning(f"Workflow file does not exist at: {workflow_file}")
-            self.FailRender(f"Workflow file not found: {workflow_file}")
+            raise ComfyUIError(f"Workflow file not found: {workflow_file}")
             return None
         
         try:
@@ -895,7 +902,7 @@ print('Dummy command timeout reached or task completed.')
             return workflow_data
         except Exception as e:
             self.LogWarning(f"Error loading or validating workflow file '{workflow_file}': {e}")
-            self.FailRender(f"Error loading or validating workflow file: {str(e)}")
+            raise ComfyUIError(f"Error loading or validating workflow file: {str(e)}")
             return None
 
     def _get_workflow_file_path(self) -> str:
@@ -1167,6 +1174,12 @@ print('Dummy command timeout reached or task completed.')
 
         self.LogWarning(f"ComfyUI error: {error_msg}")
 
+        # Optional custom-node imports can log caught Python exceptions while
+        # ComfyUI starts successfully. Missing required nodes are checked when
+        # the API validates the prompt; a fatal startup still exits the process.
+        if not self.server_started:
+            return
+
         if not self.task_completed:
             self.FailRender(f"ComfyUI error: {error_msg}")
 
@@ -1178,7 +1191,7 @@ print('Dummy command timeout reached or task completed.')
             response = self.http_request(f"{self.comfyui_api_url}/prompt")
             if response['status_code'] != 200:
                 self.LogWarning(f"Error connecting to ComfyUI API: {response['status_code']}")
-                self.FailRender(f"Error connecting to ComfyUI API: {response['status_code']}")
+                raise ComfyUIError(f"Error connecting to ComfyUI API: {response['status_code']}")
                 return False
                 
             self.client_id = f"deadline-{uuid.uuid4().hex}"
@@ -1186,7 +1199,7 @@ print('Dummy command timeout reached or task completed.')
             return True
         except Exception as e:
             self.LogWarning(f"Error initializing API connection: {e}")
-            self.FailRender(f"Error initializing API connection: {str(e)}")
+            raise ComfyUIError(f"Error initializing API connection: {str(e)}")
             return False
     
     def queue_workflow(self, workflow_data: dict) -> bool:
@@ -1204,7 +1217,7 @@ print('Dummy command timeout reached or task completed.')
             return True
         except Exception as e:
             self.LogWarning(f"Error queuing workflow: {e}")
-            self.FailRender(f"Error queuing workflow: {str(e)}")
+            raise ComfyUIError(f"Error queuing workflow: {str(e)}")
             return False
 
     def _reset_prompt_tracking(self):
@@ -1230,7 +1243,7 @@ print('Dummy command timeout reached or task completed.')
         
         if response['status_code'] != 200:
             self.LogWarning(f"Error queuing prompt: {response['text']}")
-            self.FailRender(f"Error queuing prompt: {response['text']}")
+            raise ComfyUIError(f"Error queuing prompt: {response['text']}")
             return False
         
         self.prompt_id = response['json']()['prompt_id']
@@ -1309,21 +1322,16 @@ print('Dummy command timeout reached or task completed.')
         if self.prompt_id not in history_data:
             return False
             
-        # Check for outputs indicating completion
-        if 'outputs' in history_data[self.prompt_id]:
-            return self._handle_prompt_completion(history_data[self.prompt_id]['outputs'])
-        
-        # Check for error status
-        elif 'status' in history_data[self.prompt_id]:
-            return self._handle_prompt_status(history_data[self.prompt_id]['status'])
-                    
+        entry = history_data[self.prompt_id]
+        status = entry.get('status', {})
+        self._handle_prompt_status(status)
+        # Failed history can contain partial outputs. Only explicit success counts.
+        if status.get('status_str') == 'success' and status.get('completed') is True:
+            return self._handle_prompt_completion(entry.get('outputs', {}))
         return False
 
     def _handle_prompt_completion(self, outputs: dict) -> bool:
         """Handle completed prompt outputs"""
-        if not outputs:
-            return False
-            
         self.LogInfo(f"Workflow complete: Found outputs in history for prompt {self.prompt_id}")
         
         # Mark prompt as completed
@@ -1381,7 +1389,9 @@ print('Dummy command timeout reached or task completed.')
 
     def _handle_prompt_status(self, status: dict) -> bool:
         """Handle prompt status information"""
-        if status.get('status') == 'error':
+        if status.get('status_str', status.get('status')) == 'error' or any(
+                msg[0] in ('execution_error', 'execution_interrupted')
+                for msg in status.get('messages', []) if isinstance(msg, (list, tuple)) and msg):
             return self._handle_prompt_error(status)
         
         # Update progress from execution status
@@ -1392,9 +1402,9 @@ print('Dummy command timeout reached or task completed.')
 
     def _handle_prompt_error(self, status: dict) -> bool:
         """Handle prompt execution errors"""
-        error_msg = status.get('error', 'Unknown error')
+        error_msg = status.get('error') or json.dumps(status.get('messages', status), ensure_ascii=False)
         self.LogWarning(f"ComfyUI reported error for prompt {self.prompt_id}: {error_msg}")
-        self.FailRender(f"ComfyUI workflow failed: {error_msg}")
+        raise ComfyUIError(f"ComfyUI workflow failed: {error_msg}")
         return True
 
     def _update_execution_progress(self, progress: float):
@@ -1542,6 +1552,8 @@ print('Dummy command timeout reached or task completed.')
             else:
                 if verbose_log:
                     self.LogWarning(f"Unexpected response from history endpoint: {history_response['status_code']}")
+        except ComfyUIError:
+            raise
         except Exception as e:
             self.LogWarning(f"Error checking history endpoint: {e}")
         
@@ -1589,4 +1601,8 @@ print('Dummy command timeout reached or task completed.')
         except Exception as e:
             self.LogWarning(f"Error during workflow submission: {e}")
             traceback.print_exc()
-            self.FailRender(f"Error during workflow submission: {str(e)}")
+            self.thread_running = False
+            self.task_completed = False
+            # FailRender only raises on this Python thread. AbortRender signals
+            # the managed-process loop so Deadline stops it and records an error.
+            self.AbortRender(f"Error during workflow submission: {str(e)}")

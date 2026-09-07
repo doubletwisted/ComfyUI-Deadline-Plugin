@@ -343,6 +343,11 @@ class DeadlineJobSubmitter:
             handle.write(f"Frames=0-{batch_count - 1}\n")
             handle.write(f"ChunkSize={chunk_size}\n")
             handle.write(f"OutputDirectory0={output_dir}\n")
+            machine_list = config.get("machine_list", "")
+            if machine_list:
+                if not re.fullmatch(r"[A-Za-z0-9_,.\-]+", machine_list):
+                    raise ValueError("Machine list must contain comma-separated Worker names.")
+                handle.write(f"Whitelist={machine_list}\n")
 
     def _write_plugin_info(self, path: str) -> None:
         config = self.job_config
@@ -359,6 +364,8 @@ class DeadlineJobSubmitter:
             "WorkerMode": "False",
             "DistributedMode": "False",
             "ForceNewInstance": "True",
+            "DisableDynamicVRAM": str(bool(config.get("disable_dynamic_vram", False))),
+            "ReserveVRAM": str(max(0.0, min(64.0, float(config.get("reserve_vram", 0.0))))),
         }
 
         with open(path, "w", encoding="utf-8") as handle:
@@ -461,6 +468,9 @@ class DeadlineSubmitNode:
             "optional": {
                 "comment": ("STRING", {"default": ""}),
                 "department": ("STRING", {"default": ""}),
+                "machine_list": ("STRING", {"default": "", "tooltip": "Optional comma-separated Deadline Worker allowlist."}),
+                "disable_dynamic_vram": ("BOOLEAN", {"default": False}),
+                "reserve_vram": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 64.0, "step": 0.5, "tooltip": "GB reserved for activations and other GPU users."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -509,6 +519,9 @@ class DeadlineSubmitNode:
         job_name,
         comment="",
         department="",
+        machine_list="",
+        disable_dynamic_vram=False,
+        reserve_vram=0.0,
         prompt=None,
         extra_pnginfo=None,
         **_legacy_inputs,
@@ -543,6 +556,9 @@ class DeadlineSubmitNode:
                 "standard_workflow": standard_workflow,
                 "comment": comment,
                 "department": department,
+                "machine_list": ",".join(part.strip() for part in machine_list.split(",") if part.strip()),
+                "disable_dynamic_vram": disable_dynamic_vram,
+                "reserve_vram": reserve_vram,
             }
 
             submitter = DeadlineJobSubmitter(worker_prompt, job_config)
