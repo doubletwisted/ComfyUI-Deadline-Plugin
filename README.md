@@ -53,9 +53,9 @@ Workers try those paths in order and use the first one that contains `ComfyUI\ma
 
 ## Reusing a worker's GUI session
 
-Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification requires the plugin's `/deadline/session` identity response, a matching ComfyUI installation root, and a live process/session ID; an unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
 
-Endpoint reuse is intentionally rejected for jobs that require a staged input folder or custom output folder, because a GUI session was not started with those paths. Such jobs use the configured fallback launch instead.
+For a verified reused endpoint, task inputs are copied into an isolated `input/deadline/<submission-id>` subtree and recorded outputs are copied to the job output directory.
 
 ## Use It
 
@@ -94,6 +94,19 @@ Deadline gets both files:
 
 The worker writes the normal workflow metadata back into the output image when ComfyUI provides it. So dragging the finished image back into ComfyUI should reopen the readable graph, not the ugly API-format graph.
 
+## Headless-safety preflight
+
+Every variation is checked on the selected Deadline worker after input staging, seed expansion, and fixed-switch resolution. The worker:
+
+- validates every `class_type` against that worker's live `/object_info`;
+- rejects missing staged inputs and known browser-interactive nodes;
+- removes fixed `ImpactSwitch`, `LatentSwitch`, and `SEGSSwitch` pass-through nodes by reconnecting consumers to the selected upstream input;
+- sends the complete submitted `extra_pnginfo.workflow` to metadata-aware nodes;
+- verifies that ComfyUI history reports the expected output nodes and that every reported file exists;
+- turns prompt-validation errors, execution exceptions, early process exits, HTTP timeouts, missing output, and Deadline task timeouts into task failures.
+
+Dynamic/connected switch selections are not rewritten. Browser-driven chooser/picker/preview-bridge nodes (`FL_ImagePicker`, `easy imageChooser`, `ImageChooser`, `PreviewChooser`, `PreviewBridge`, and `ImpactPreviewBridge`) are rejected because a farm render has no user to answer them. Other nodes using `PROMPT`, `DYNPROMPT`, `UNIQUE_ID`, or `EXTRA_PNGINFO` remain supported when the worker has the node and the submission includes full workflow metadata. Unknown third-party interactive nodes cannot be identified from `/object_info` alone; add their exact `class_type` to `KNOWN_UI_DEPENDENT_NODE_TYPES` after confirming that they wait for frontend state.
+
 ## Maintenance Scripts
 
 There are sanitized Deadline maintenance-job templates in `scripts/maintenance`.
@@ -115,6 +128,6 @@ python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type model
 
 - This targets portable Windows ComfyUI workers.
 - Deadline handles render timeouts. Set those in Deadline Monitor.
-- The old fake `/deadline/*` API routes are gone from this plugin. If you use `ComfyUI-Deadline-Distributed`, it owns its own routes.
+- `/deadline/session` is identity-only and is used to prove endpoint ownership. `ComfyUI-Deadline-Distributed` continues to own its execution routes.
 
-Run the endpoint-policy regression tests with `python tests/test_reuse_endpoint.py`.
+Run all regression tests with `python -m unittest discover -s tests -v`.

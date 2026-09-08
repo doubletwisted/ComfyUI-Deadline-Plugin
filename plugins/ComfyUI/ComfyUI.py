@@ -47,6 +47,35 @@ DEADLINE_SEED_NODE_TYPES = {"DeadlineSeed", "DeadlineDistributedSeed", "Distribu
 # Output node types that indicate the workflow will produce output
 OUTPUT_NODE_TYPES = ["SaveImage", "PreviewImage", "SaveVideo"]
 
+# Nodes in this set wait for a browser/client decision or consume state that is
+# only created by a frontend extension.  Metadata-aware save/display nodes are
+# deliberately not included: PROMPT, DYNPROMPT, UNIQUE_ID and EXTRA_PNGINFO are
+# normal ComfyUI hidden inputs and are safe when their required metadata exists.
+KNOWN_UI_DEPENDENT_NODE_TYPES = {
+    "FL_ImagePicker",
+    "easy imageChooser",
+    "ImageChooser",
+    "PreviewChooser",
+    "PreviewBridge",
+    "ImpactPreviewBridge",
+}
+
+WORKFLOW_METADATA_REQUIRED_NODE_TYPES = {
+    "WidgetToString",
+    "ImpactControlBridge",
+}
+
+# Fixed pass-through switches can be removed from the API graph.  The selected
+# upstream connection is wired directly into every consumer.  This is a graph
+# transform, not a runtime workaround for any individual custom node.
+FIXED_SWITCH_SPECS = {
+    "ImpactSwitch": {"select": "select", "input": "input{index}", "constants": {1: "input{index}", 2: "index"}},
+    "LatentSwitch": {"select": "select", "input": "input{index}"},
+    "SEGSSwitch": {"select": "select", "input": "input{index}"},
+}
+
+FILE_OUTPUT_GROUPS = ("images", "gifs", "videos", "audio")
+
 def get_distributed_config_for_plugin(plugin) -> Tuple[bool, bool, bool]:
     """Get distributed configuration with plugin info priority, fallback to environment"""
     # Priority 1: Plugin info entries (preferred)
@@ -138,6 +167,9 @@ class ComfyUI(DeadlinePlugin):
         self.reuse_completion_marker = ""
         self.reuse_gui_output_root = ""
         self.reuse_gui_input_root = ""
+        self.endpoint_session_id = ""
+        self.object_info = None
+        self.expected_outputs_by_prompt = {}
         
         # Batch processing variables
         self.chunk_size = 1
@@ -499,9 +531,19 @@ class ComfyUI(DeadlinePlugin):
         try:
             prompt = self.http_request(endpoint + "/prompt", verbose=False)
             stats = self.http_request(endpoint + "/system_stats", verbose=False)
+            identity = self.http_request(endpoint + "/deadline/session", verbose=False)
             data = stats["json"]()
-            if prompt["status_code"] != 200 or stats["status_code"] != 200 or not isinstance(data, dict) or "devices" not in data:
+            identity_data = identity["json"]() if identity["status_code"] == 200 else {}
+            expected_root = os.path.normcase(os.path.realpath(os.path.join(self.comfyui_install_path, "ComfyUI")))
+            actual_root = os.path.normcase(os.path.realpath(str(identity_data.get("comfyui_root", ""))))
+            if (prompt["status_code"] != 200 or stats["status_code"] != 200 or
+                    not isinstance(data, dict) or "devices" not in data or
+                    identity_data.get("product") != "ComfyUI-Deadline-Plugin" or
+                    identity_data.get("protocol") != 1 or
+                    not identity_data.get("session_id") or not identity_data.get("pid") or
+                    actual_root != expected_root):
                 return False
+            self.endpoint_session_id = str(identity_data["session_id"])
             argv = data.get("system", {}).get("argv", [])
             if "--input-directory" in argv:
                 position = argv.index("--input-directory") + 1
@@ -517,6 +559,10 @@ class ComfyUI(DeadlinePlugin):
                 self.reuse_gui_output_root = argv[position]
             else:
                 self.reuse_gui_output_root = os.path.join(self.comfyui_install_path, "ComfyUI", "output")
+            self.LogInfo(
+                f"Verified ComfyUI endpoint ownership: pid={identity_data['pid']}, "
+                f"session={self.endpoint_session_id}, root={actual_root}"
+            )
             return True
         except Exception as e:
             self.LogInfo(f"Configured ComfyUI endpoint {endpoint} unavailable: {e}")
@@ -623,6 +669,16 @@ class ComfyUI(DeadlinePlugin):
     def PostRenderTasks(self):
         """Cleanup tasks after rendering"""
         self.LogInfo("ComfyUI PostRenderTasks started.")
+
+        if not self.task_completed:
+            message = (
+                f"ComfyUI process ended before this Deadline task completed on worker {self.GetSlaveName()}; "
+                f"server_started={self.server_started}, workflow_submitted={self.workflow_submitted}, "
+                f"completed_prompts={self.prompts_executed}/{self.chunk_size}."
+            )
+            self.LogWarning(message)
+            self.FailRender(message)
+            return
         
         # Wait for files to be written
         self.LogInfo("Waiting for files to be written to disk...")
@@ -835,7 +891,7 @@ sys.exit(0 if result.get('success') else 1)
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 response_data = response.read().decode('utf-8')
                 return {
                     'status_code': response.status,
@@ -1323,6 +1379,15 @@ sys.exit(0 if result.get('success') else 1)
                 
             self.client_id = f"deadline-{uuid.uuid4().hex}"
             self.LogInfo(f"Got client ID: {self.client_id}")
+            object_info_response = self.http_request(f"{self.comfyui_api_url}/object_info")
+            if object_info_response['status_code'] != 200:
+                raise ComfyUIError(
+                    f"Worker {self.GetSlaveName()} did not return /object_info "
+                    f"(HTTP {object_info_response['status_code']})."
+                )
+            self.object_info = object_info_response['json']()
+            if not isinstance(self.object_info, dict) or not self.object_info:
+                raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid /object_info data.")
             return True
         except Exception as e:
             self.LogWarning(f"Error initializing API connection: {e}")
@@ -1336,8 +1401,12 @@ sys.exit(0 if result.get('success') else 1)
 
             for variation_index in self.assigned_variation_indices:
                 prompt_workflow, metadata, workflow_metadata = self._prepare_variation_prompt(workflow_data, variation_index)
+                prompt_workflow, expected_outputs = self._preflight_worker_payload(
+                    prompt_workflow, workflow_metadata
+                )
                 if not self._queue_prompt(prompt_workflow, metadata, workflow_metadata):
                     return False
+                self.expected_outputs_by_prompt[self.prompt_id] = expected_outputs
                 time.sleep(0.2)
 
             self.LogInfo(f"Queued total of {len(self.prompt_ids)} prompts: {self.prompt_ids}")
@@ -1352,6 +1421,150 @@ sys.exit(0 if result.get('success') else 1)
         self.prompt_ids = []
         self.completed_prompts = set()
         self.current_tracking_index = 0
+        self.expected_outputs_by_prompt = {}
+
+    def _workflow_title_map(self, workflow_metadata=None):
+        """Return API node id -> human title from the full UI workflow."""
+        workflow = workflow_metadata if workflow_metadata is not None else self.standard_workflow
+        result = {}
+        if not isinstance(workflow, dict):
+            return result
+        for node in workflow.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id", ""))
+            properties = node.get("properties", {}) if isinstance(node.get("properties"), dict) else {}
+            result[node_id] = str(node.get("title") or properties.get("title") or node.get("type") or "")
+        return result
+
+    def _node_context(self, node_id, prompt=None, workflow_metadata=None, class_type=None):
+        node_id = str(node_id) if node_id is not None else "unknown"
+        prompt = prompt or getattr(self, "current_prompt_payload", {}) or {}
+        node = prompt.get(node_id, {}) if isinstance(prompt, dict) else {}
+        class_type = class_type or (node.get("class_type") if isinstance(node, dict) else None) or "unknown"
+        title = self._workflow_title_map(workflow_metadata).get(node_id) or class_type
+        return f"node {node_id} ('{title}', class_type={class_type}) on worker {self.GetSlaveName()}"
+
+    @staticmethod
+    def _is_link(value):
+        return isinstance(value, (list, tuple)) and len(value) == 2 and str(value[0]) != ""
+
+    def _resolve_fixed_switches(self, prompt, workflow_metadata=None):
+        """Remove supported constant-selection switches and reconnect consumers."""
+        for switch_id, switch in list(prompt.items()):
+            if not isinstance(switch, dict):
+                continue
+            class_type = switch.get("class_type")
+            spec = FIXED_SWITCH_SPECS.get(class_type)
+            if not spec:
+                continue
+            inputs = switch.get("inputs", {})
+            raw_select = inputs.get(spec["select"])
+            if self._is_link(raw_select):
+                raise ComfyUIError(
+                    f"Headless preflight rejected dynamic switch {self._node_context(switch_id, prompt, workflow_metadata)}: "
+                    "the selection is connected and cannot be proven fixed."
+                )
+            try:
+                selected_index = int(raw_select)
+            except (TypeError, ValueError):
+                raise ComfyUIError(
+                    f"Headless preflight rejected {self._node_context(switch_id, prompt, workflow_metadata)}: "
+                    f"invalid fixed selection {raw_select!r}."
+                )
+            input_name = spec["input"].format(index=selected_index)
+            selected_value = inputs.get(input_name)
+            if not self._is_link(selected_value):
+                raise ComfyUIError(
+                    f"Headless preflight rejected {self._node_context(switch_id, prompt, workflow_metadata)}: "
+                    f"selected input '{input_name}' is not connected."
+                )
+
+            replacements = {0: list(selected_value)}
+            for output_index, value_spec in spec.get("constants", {}).items():
+                replacements[output_index] = (
+                    input_name if value_spec == "input{index}" else selected_index
+                )
+            consumers = 0
+            for node in prompt.values():
+                if not isinstance(node, dict):
+                    continue
+                for key, value in list(node.get("inputs", {}).items()):
+                    if self._is_link(value) and str(value[0]) == str(switch_id):
+                        output_index = int(value[1])
+                        if output_index not in replacements:
+                            raise ComfyUIError(
+                                f"Headless preflight cannot remove {self._node_context(switch_id, prompt, workflow_metadata)}: "
+                                f"consumer uses unsupported output {output_index}."
+                            )
+                        node["inputs"][key] = copy.deepcopy(replacements[output_index])
+                        consumers += 1
+            del prompt[switch_id]
+            self.LogInfo(
+                f"Headless preflight resolved fixed {class_type} node {switch_id} "
+                f"to {input_name} and rewired {consumers} consumer(s)."
+            )
+        return prompt
+
+    def _preflight_worker_payload(self, prompt, workflow_metadata=None):
+        """Validate the exact, post-staging and post-variation API payload."""
+        if not isinstance(prompt, dict) or not prompt:
+            raise ComfyUIError(f"Headless preflight received an empty prompt on worker {self.GetSlaveName()}.")
+        prompt = self._resolve_fixed_switches(prompt, workflow_metadata)
+        object_info = self.object_info or {}
+        expected_outputs = []
+        for node_id, node in prompt.items():
+            if not isinstance(node, dict):
+                raise ComfyUIError(f"Headless preflight found malformed node {node_id} on worker {self.GetSlaveName()}.")
+            class_type = node.get("class_type")
+            context = self._node_context(node_id, prompt, workflow_metadata, class_type)
+            if not class_type or class_type not in object_info:
+                raise ComfyUIError(f"Headless preflight failed: {context} is not installed in /object_info.")
+            if class_type in KNOWN_UI_DEPENDENT_NODE_TYPES:
+                raise ComfyUIError(
+                    f"Headless preflight rejected {context}: this node requires an interactive browser/frontend decision."
+                )
+            definition = object_info[class_type]
+            if class_type in WORKFLOW_METADATA_REQUIRED_NODE_TYPES and not isinstance(workflow_metadata, dict):
+                raise ComfyUIError(
+                    f"Headless preflight rejected {context}: this node reads GUI graph state but full "
+                    "extra_pnginfo.workflow metadata was not included in the submission."
+                )
+            declared_inputs = definition.get("input", {}) if isinstance(definition, dict) else {}
+            for section in ("required", "optional"):
+                for input_name, input_spec in declared_inputs.get(section, {}).items():
+                    options = input_spec[1] if isinstance(input_spec, list) and len(input_spec) > 1 and isinstance(input_spec[1], dict) else {}
+                    is_staged_file = bool(options.get("image_upload")) or (
+                        class_type in {"LoadImage", "LoadImageMask", "LoadAudio", "LoadVideo"}
+                        and input_name in {"image", "audio", "video", "file"}
+                    )
+                    value = node.get("inputs", {}).get(input_name)
+                    if not is_staged_file or not isinstance(value, str):
+                        continue
+                    clean_value = re.sub(r"\s+\[(input|output|temp)\]\s*$", "", value.strip())
+                    root = self.reuse_gui_input_root if self.use_existing_comfyui else self.comfyui_input_dir
+                    candidate = os.path.abspath(os.path.join(root, clean_value))
+                    try:
+                        safe = not os.path.isabs(clean_value) and os.path.commonpath([os.path.abspath(root), candidate]) == os.path.abspath(root)
+                    except ValueError:
+                        safe = False
+                    if not safe or not os.path.isfile(candidate):
+                        raise ComfyUIError(
+                            f"Headless preflight rejected invalid staged path on {context}, input '{input_name}': {value}"
+                        )
+            if definition.get("output_node") and re.search(r"save|preview|video|image|audio", class_type, re.I):
+                expected_outputs.append(str(node_id))
+
+        if not expected_outputs:
+            raise ComfyUIError(
+                f"Headless preflight found no file-producing output node on worker {self.GetSlaveName()}."
+            )
+        self.current_prompt_payload = prompt
+        self.LogInfo(
+            f"Headless preflight passed for {len(prompt)} node(s) on worker {self.GetSlaveName()}; "
+            f"expected output nodes: {', '.join(expected_outputs)}"
+        )
+        return prompt, expected_outputs
 
     def _queue_prompt(self, workflow_data: dict, deadline_metadata: dict, workflow_metadata: dict = None) -> bool:
         """Queue one prepared variation prompt to ComfyUI."""
@@ -1370,7 +1583,14 @@ sys.exit(0 if result.get('success') else 1)
         
         if response['status_code'] != 200:
             self.LogWarning(f"Error queuing prompt: {response['text']}")
-            raise ComfyUIError(f"Error queuing prompt: {response['text']}")
+            try:
+                response_data = response['json']()
+            except Exception:
+                response_data = response.get('text', '')
+            raise ComfyUIError(
+                "ComfyUI prompt validation failed: "
+                + self._format_comfy_error(response_data, workflow_data, workflow_metadata)
+            )
             return False
         
         self.prompt_id = response['json']()['prompt_id']
@@ -1487,11 +1707,44 @@ sys.exit(0 if result.get('success') else 1)
             return self._handle_prompt_completion(entry.get('outputs', {}))
         return False
 
+    def _format_comfy_error(self, error, prompt=None, workflow_metadata=None):
+        """Keep ComfyUI's original error and prefix any available node context."""
+        node_id = None
+        class_type = None
+        if isinstance(error, list):
+            messages = error
+        elif isinstance(error, dict):
+            node_id = error.get("node_id")
+            class_type = error.get("node_type") or error.get("class_type")
+            node_errors = error.get("node_errors")
+            if isinstance(node_errors, dict) and node_errors:
+                node_id, details = next(iter(node_errors.items()))
+                if isinstance(details, dict):
+                    class_type = details.get("class_type") or class_type
+            messages = error.get("messages")
+        else:
+            messages = None
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, (list, tuple)) or len(message) < 2 or not isinstance(message[1], dict):
+                    continue
+                details = message[1]
+                node_id = details.get("node_id", node_id)
+                class_type = details.get("node_type", class_type)
+                if node_id is not None:
+                    break
+        original = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False, default=str)
+        if node_id is None:
+            return f"worker {self.GetSlaveName()}: {original}"
+        return f"{self._node_context(node_id, prompt, workflow_metadata, class_type)}: {original}"
+
     def _handle_prompt_completion(self, outputs: dict) -> bool:
         """Handle completed prompt outputs"""
         self.LogInfo(f"Workflow complete: Found outputs in history for prompt {self.prompt_id}")
         
-        # Mark prompt as completed
+        self._validate_expected_outputs(outputs)
+
+        # Mark prompt as completed only after the expected artifacts exist.
         if self.prompt_id not in self.completed_prompts:
             self.completed_prompts.add(self.prompt_id)
             self.prompts_executed += 1
@@ -1551,6 +1804,43 @@ sys.exit(0 if result.get('success') else 1)
             if copied == 0:
                 raise ComfyUIError("Reused endpoint completed without an output file recorded for this task.")
 
+    def _validate_expected_outputs(self, outputs):
+        expected = getattr(self, "expected_outputs_by_prompt", {}).get(self.prompt_id, [])
+        if not expected:
+            return
+        missing_nodes = [node_id for node_id in expected if not isinstance(outputs.get(node_id), dict)]
+        file_items = []
+        for node_id in expected:
+            node_outputs = outputs.get(node_id, {})
+            for group in FILE_OUTPUT_GROUPS:
+                for item in node_outputs.get(group, []):
+                    if isinstance(item, dict) and item.get("filename"):
+                        file_items.append((node_id, item))
+        if missing_nodes or not file_items:
+            context = ", ".join(self._node_context(node_id) for node_id in (missing_nodes or expected))
+            raise ComfyUIError(
+                f"ComfyUI reported success but expected output is missing for {context}. "
+                f"History outputs: {json.dumps(outputs, ensure_ascii=False, default=str)}"
+            )
+
+        output_root = self.reuse_gui_output_root if self.use_existing_comfyui else self.comfyui_output_dir
+        temp_root = os.path.join(self.comfyui_install_path, "ComfyUI", "temp")
+        for node_id, item in file_items:
+            kind = item.get("type", "output")
+            root = temp_root if kind == "temp" else output_root
+            relative = os.path.join(str(item.get("subfolder", "")), str(item["filename"]))
+            candidate = os.path.abspath(os.path.join(root, relative))
+            normalized_root = os.path.abspath(root)
+            try:
+                safe = os.path.commonpath([normalized_root, candidate]) == normalized_root
+            except ValueError:
+                safe = False
+            if not safe or not os.path.isfile(candidate):
+                raise ComfyUIError(
+                    f"ComfyUI reported success but expected output file is missing for "
+                    f"{self._node_context(node_id)}: {candidate}"
+                )
+
     def _complete_task(self):
         """Mark task as complete"""
         self.SetProgress(100)
@@ -1591,7 +1881,8 @@ sys.exit(0 if result.get('success') else 1)
 
     def _handle_prompt_error(self, status: dict) -> bool:
         """Handle prompt execution errors"""
-        error_msg = status.get('error') or json.dumps(status.get('messages', status), ensure_ascii=False)
+        error_data = status.get('error') or status.get('messages', status)
+        error_msg = self._format_comfy_error(error_data)
         self.LogWarning(f"ComfyUI reported error for prompt {self.prompt_id}: {error_msg}")
         raise ComfyUIError(f"ComfyUI workflow failed: {error_msg}")
         return True

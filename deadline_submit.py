@@ -38,6 +38,11 @@ MEDIA_EXTENSIONS = {
     ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
 }
 
+# A worker that is allowed to reuse a long-running GUI endpoint must prove that
+# the endpoint belongs to this installation.  A random value created at module
+# import also distinguishes a restarted ComfyUI session from the old process.
+DEADLINE_ENDPOINT_SESSION_ID = uuid.uuid4().hex
+
 
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
@@ -688,6 +693,26 @@ def register_on_prompt_handler() -> None:
             print("Deadline Submission: Registered submit-only prompt handler.")
     except Exception as exc:
         print(f"Deadline Submission: Could not register prompt handler: {exc}")
+
+    try:
+        from aiohttp import web
+        import folder_paths
+        import server
+
+        instance = getattr(getattr(server, "PromptServer", None), "instance", None)
+        if instance and hasattr(instance, "routes"):
+            @instance.routes.get("/deadline/session")
+            async def deadline_session(_request):
+                return web.json_response({
+                    "product": "ComfyUI-Deadline-Plugin",
+                    "protocol": 1,
+                    "session_id": DEADLINE_ENDPOINT_SESSION_ID,
+                    "pid": os.getpid(),
+                    "comfyui_root": os.path.abspath(folder_paths.base_path),
+                })
+            print(f"Deadline Submission: Registered endpoint identity {DEADLINE_ENDPOINT_SESSION_ID}.")
+    except Exception as exc:
+        print(f"Deadline Submission: Could not register endpoint identity route: {exc}")
 
 
 NODE_CLASS_MAPPINGS = {

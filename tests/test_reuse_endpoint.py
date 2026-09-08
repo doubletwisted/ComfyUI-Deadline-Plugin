@@ -98,6 +98,9 @@ def new_plugin(**attrs):
     plugin.reuse_completion_marker = ""
     plugin.comfyui_install_path = ""
     plugin.reuse_gui_output_root = ""
+    plugin.object_info = {}
+    plugin.expected_outputs_by_prompt = {}
+    plugin.standard_workflow = None
     plugin.GetSlaveName = lambda: "M21"
     plugin.GetPluginInfoEntryWithDefault = lambda key, default: default
     plugin.LogInfo = lambda message: plugin.logs.append(("info", message))
@@ -172,18 +175,42 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
                     plugin._load_worker_endpoint_policy()
 
     def test_configured_endpoint_reuses_verified_server(self):
+        install = os.path.abspath("C:/Comfy")
         plugin = new_plugin(
+            comfyui_install_path=install,
             configured_comfyui_api_url="http://127.0.0.1:8188",
             endpoint_policy_active=True,
-            http_request=lambda url, **kwargs: {
+            http_request=lambda url, **kwargs: ({
                 "status_code": 200,
-                "json": lambda: {"devices": [{"name": "GPU"}]},
-            },
+                "json": lambda: {
+                    "product": "ComfyUI-Deadline-Plugin", "protocol": 1,
+                    "session_id": "session-a", "pid": 123,
+                    "comfyui_root": os.path.join(install, "ComfyUI"),
+                },
+            } if url.endswith("/deadline/session") else {
+                "status_code": 200,
+                "json": lambda: {"devices": [{"name": "GPU"}], "system": {"argv": []}},
+            }),
         )
         plugin._configure_policy_endpoint()
         self.assertTrue(plugin.use_existing_comfyui)
         self.assertTrue(plugin.server_started)
         self.assertEqual(plugin.comfyui_port, "8188")
+        self.assertEqual(plugin.endpoint_session_id, "session-a")
+
+    def test_reuse_rejects_right_api_from_wrong_installation(self):
+        plugin = new_plugin(
+            comfyui_install_path=os.path.abspath("C:/Expected"),
+            http_request=lambda url, **kwargs: ({
+                "status_code": 200,
+                "json": lambda: {"product": "ComfyUI-Deadline-Plugin", "protocol": 1,
+                                  "session_id": "other", "pid": 42,
+                                  "comfyui_root": os.path.abspath("C:/Other/ComfyUI")},
+            } if url.endswith("/deadline/session") else {
+                "status_code": 200, "json": lambda: {"devices": [{}], "system": {"argv": []}}
+            }),
+        )
+        self.assertFalse(plugin._verified_comfy_endpoint("http://127.0.0.1:8188"))
 
     def test_unverified_occupied_endpoint_fails_closed(self):
         plugin = new_plugin(
