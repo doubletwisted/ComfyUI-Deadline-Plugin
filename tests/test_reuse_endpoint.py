@@ -212,6 +212,25 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
         )
         self.assertFalse(plugin._verified_comfy_endpoint("http://127.0.0.1:8188"))
 
+    def test_legacy_endpoint_requires_verified_os_process_owner(self):
+        install = os.path.abspath("C:/Comfy")
+        plugin = new_plugin(
+            comfyui_install_path=install,
+            _local_port_process_identity=lambda port: {
+                "product": "ComfyUI-Deadline-Plugin", "protocol": 1,
+                "session_id": "legacy-pid-42", "pid": 42,
+                "comfyui_root": os.path.join(install, "ComfyUI"),
+            },
+            http_request=lambda url, **kwargs: ({
+                "status_code": 404, "json": lambda: {},
+            } if url.endswith("/deadline/session") else {
+                "status_code": 200,
+                "json": lambda: {"devices": [{"name": "GPU"}], "system": {"argv": []}},
+            }),
+        )
+        self.assertTrue(plugin._verified_comfy_endpoint("http://127.0.0.1:8188"))
+        self.assertEqual(plugin.endpoint_session_id, "legacy-pid-42")
+
     def test_unverified_occupied_endpoint_fails_closed(self):
         plugin = new_plugin(
             configured_comfyui_api_url="http://127.0.0.1:8188",

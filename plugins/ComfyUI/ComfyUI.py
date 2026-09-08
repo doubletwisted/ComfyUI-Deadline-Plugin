@@ -536,6 +536,9 @@ class ComfyUI(DeadlinePlugin):
             identity_data = identity["json"]() if identity["status_code"] == 200 else {}
             expected_root = os.path.normcase(os.path.realpath(os.path.join(self.comfyui_install_path, "ComfyUI")))
             actual_root = os.path.normcase(os.path.realpath(str(identity_data.get("comfyui_root", ""))))
+            if not identity_data:
+                identity_data = self._local_port_process_identity(urllib.parse.urlparse(endpoint).port)
+                actual_root = expected_root if identity_data else ""
             if (prompt["status_code"] != 200 or stats["status_code"] != 200 or
                     not isinstance(data, dict) or "devices" not in data or
                     identity_data.get("product") != "ComfyUI-Deadline-Plugin" or
@@ -567,6 +570,53 @@ class ComfyUI(DeadlinePlugin):
         except Exception as e:
             self.LogInfo(f"Configured ComfyUI endpoint {endpoint} unavailable: {e}")
             return False
+
+    def _local_port_process_identity(self, port):
+        """Verify a legacy endpoint by the OS port owner and exact install Python."""
+        if platform.system().lower() != "windows":
+            return {}
+        try:
+            netstat = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                stderr=subprocess.STDOUT, universal_newlines=True, timeout=10,
+            )
+            pid = None
+            for line in netstat.splitlines():
+                columns = line.split()
+                if len(columns) < 5 or columns[-2].upper() != "LISTENING":
+                    continue
+                local_address = columns[1].rsplit(":", 1)
+                if len(local_address) == 2 and local_address[1] == str(port):
+                    pid = int(columns[-1])
+                    break
+            if not pid:
+                return {}
+            ps_command = (
+                f"Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" | "
+                "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+            )
+            process_json = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_command],
+                stderr=subprocess.STDOUT, universal_newlines=True, timeout=15,
+            ).strip()
+            process_data = json.loads(process_json)
+            expected_python = os.path.normcase(os.path.realpath(
+                os.path.join(self.comfyui_install_path, "python_embeded", "python.exe")
+            ))
+            actual_python = os.path.normcase(os.path.realpath(process_data.get("ExecutablePath", "")))
+            command_line = str(process_data.get("CommandLine", "")).lower().replace("\\", "/")
+            if actual_python != expected_python or "comfyui/main.py" not in command_line:
+                return {}
+            return {
+                "product": "ComfyUI-Deadline-Plugin",
+                "protocol": 1,
+                "session_id": f"legacy-pid-{pid}",
+                "pid": pid,
+                "comfyui_root": os.path.join(self.comfyui_install_path, "ComfyUI"),
+            }
+        except Exception as e:
+            self.LogInfo(f"Could not verify legacy endpoint port owner on {port}: {e}")
+            return {}
 
     def _configure_policy_endpoint(self):
         endpoint = self.configured_comfyui_api_url
