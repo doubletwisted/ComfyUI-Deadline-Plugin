@@ -15,6 +15,9 @@ import urllib.parse
 import traceback
 import random
 import platform
+import subprocess
+import base64
+import shutil
 import copy
 import uuid
 from typing import Tuple
@@ -128,6 +131,13 @@ class ComfyUI(DeadlinePlugin):
         self.standard_workflow = None
         self.comfyui_install_path = None
         self.comfyui_path_candidates = []
+        self.use_existing_comfyui = False
+        self.endpoint_policy_active = False
+        self.configured_comfyui_api_url = ""
+        self.configured_launch_gpu_uuid = ""
+        self.reuse_completion_marker = ""
+        self.reuse_gui_output_root = ""
+        self.reuse_gui_input_root = ""
         
         # Batch processing variables
         self.chunk_size = 1
@@ -251,6 +261,11 @@ class ComfyUI(DeadlinePlugin):
             except ValueError:
                 self.LogWarning(f"Invalid CudaDeviceID value '{cuda_device_id_plugin_info}' in plugin info. Ignoring.")
 
+        # Endpoint-policy fallback resolves a stable UUID and validates it against
+        # an explicit Deadline affinity constraint before using a CUDA ordinal.
+        if assigned_gpu is None and self.endpoint_policy_active and not self.use_existing_comfyui:
+            assigned_gpu = self._get_policy_launch_gpu()
+
         # 2. Check Deadline worker GPU affinity if not set by plugin info
         if assigned_gpu is None:
             assigned_gpu = self._get_gpu_from_worker_affinity()
@@ -260,6 +275,27 @@ class ComfyUI(DeadlinePlugin):
             assigned_gpu = self._get_default_cuda_device()
 
         return f"--cuda-device {assigned_gpu}" if assigned_gpu is not None else ""
+
+    def _get_policy_launch_gpu(self) -> str:
+        gpu_uuid = self.configured_launch_gpu_uuid
+        if not gpu_uuid:
+            raise ComfyUIError("Configured endpoint is unavailable and LaunchGpuUuid is missing; refusing CUDA 0 fallback.")
+        try:
+            output = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], stderr=subprocess.STDOUT, universal_newlines=True, timeout=10)
+        except Exception as e:
+            raise ComfyUIError(f"Could not resolve LaunchGpuUuid with nvidia-smi: {e}")
+        index = None
+        for line in output.splitlines():
+            fields = [value.strip() for value in line.split(",")]
+            if len(fields) >= 2 and fields[1].lower() == gpu_uuid.lower():
+                index = int(fields[0])
+                break
+        if index is None:
+            raise ComfyUIError(f"LaunchGpuUuid '{gpu_uuid}' was not found on worker {self.GetSlaveName()}.")
+        if self.OverrideGpuAffinity() and index not in list(self.GpuAffinity() or []):
+            raise ComfyUIError(f"LaunchGpuUuid '{gpu_uuid}' resolved to CUDA {index}, outside Deadline affinity {list(self.GpuAffinity() or [])}.")
+        self.LogInfo(f"Fallback launch GPU UUID {gpu_uuid} resolved to CUDA device {index}.")
+        return str(index)
 
     def _get_gpu_from_worker_affinity(self) -> str:
         """Get GPU assignment from Deadline worker affinity settings"""
@@ -400,6 +436,8 @@ class ComfyUI(DeadlinePlugin):
 
     def _calculate_comfyui_port(self) -> str:
         """Calculate the port for ComfyUI based on CUDA device"""
+        if self.endpoint_policy_active:
+            return self._configure_policy_endpoint()
         cuda_arg = self._get_cuda_device_arg()
         cuda_device_id = None
         
@@ -418,6 +456,87 @@ class ComfyUI(DeadlinePlugin):
             self.LogInfo(f"No CUDA device ID available, using default port {base_port}")
         
         return self._determine_final_port(base_port)
+
+    def _load_worker_endpoint_policy(self):
+        worker = self.GetSlaveName()
+        try:
+            settings = RepositoryUtils.GetSlaveSettings(worker, True)
+            endpoint = settings.GetSlaveExtraInfoKeyValueWithDefault("ComfyUIApiUrl", "").strip().rstrip("/")
+            gpu_uuid = settings.GetSlaveExtraInfoKeyValueWithDefault("ComfyUILaunchGpuUuid", "").strip()
+        except Exception as e:
+            self.LogWarning(f"Could not read ComfyUI worker endpoint settings for {worker}: {e}")
+            endpoint, gpu_uuid = "", ""
+        if endpoint:
+            parsed = urllib.parse.urlparse(endpoint)
+            if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port is None or not 1 <= parsed.port <= 65535 or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username or parsed.password:
+                raise ComfyUIError(f"Worker {worker} needs a local http://127.0.0.1:<port> ComfyUIApiUrl.")
+            self.endpoint_policy_active = True
+            self.configured_comfyui_api_url = endpoint
+            self.configured_launch_gpu_uuid = gpu_uuid
+            self.LogInfo(f"Using per-worker ComfyUI endpoint policy from Deadline worker settings: {endpoint}")
+            return
+        raw = self.GetConfigEntryWithDefault("ComfyUIWorkerEndpoints", "").strip()
+        if not raw:
+            return
+        try:
+            policies = json.loads(raw)
+            entry = next((v for k, v in policies.items() if str(k).lower() == str(worker).lower()), None)
+        except Exception as e:
+            raise ComfyUIError(f"ComfyUIWorkerEndpoints must be valid JSON: {e}")
+        if entry is None:
+            return
+        if not isinstance(entry, dict):
+            raise ComfyUIError(f"Worker {worker} endpoint policy must be an object.")
+        endpoint = str(entry.get("ComfyUIApiUrl", "")).strip().rstrip("/")
+        parsed = urllib.parse.urlparse(endpoint)
+        if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port is None or not 1 <= parsed.port <= 65535 or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ComfyUIError(f"Worker {worker} needs a local http://127.0.0.1:<port> ComfyUIApiUrl.")
+        self.endpoint_policy_active = True
+        self.configured_comfyui_api_url = endpoint
+        self.configured_launch_gpu_uuid = str(entry.get("LaunchGpuUuid", "")).strip()
+
+    def _verified_comfy_endpoint(self, endpoint):
+        try:
+            prompt = self.http_request(endpoint + "/prompt", verbose=False)
+            stats = self.http_request(endpoint + "/system_stats", verbose=False)
+            data = stats["json"]()
+            if prompt["status_code"] != 200 or stats["status_code"] != 200 or not isinstance(data, dict) or "devices" not in data:
+                return False
+            argv = data.get("system", {}).get("argv", [])
+            if "--input-directory" in argv:
+                position = argv.index("--input-directory") + 1
+                if position >= len(argv) or not os.path.isabs(argv[position]):
+                    raise ComfyUIError("Existing endpoint has an unsupported input-directory argument.")
+                self.reuse_gui_input_root = argv[position]
+            else:
+                self.reuse_gui_input_root = os.path.join(self.comfyui_install_path, "ComfyUI", "input")
+            if "--output-directory" in argv:
+                position = argv.index("--output-directory") + 1
+                if position >= len(argv) or not os.path.isabs(argv[position]):
+                    raise ComfyUIError("Existing endpoint has an unsupported output-directory argument.")
+                self.reuse_gui_output_root = argv[position]
+            else:
+                self.reuse_gui_output_root = os.path.join(self.comfyui_install_path, "ComfyUI", "output")
+            return True
+        except Exception as e:
+            self.LogInfo(f"Configured ComfyUI endpoint {endpoint} unavailable: {e}")
+            return False
+
+    def _configure_policy_endpoint(self):
+        endpoint = self.configured_comfyui_api_url
+        self.use_existing_comfyui = False
+        self.reuse_gui_output_root = ""
+        self.reuse_gui_input_root = ""
+        port = urllib.parse.urlparse(endpoint).port
+        self.comfyui_api_url, self.comfyui_port = endpoint, str(port)
+        if self._verified_comfy_endpoint(endpoint):
+            self.use_existing_comfyui, self.server_started = True, True
+            self.LogInfo(f"Reusing verified ComfyUI endpoint {endpoint}; its running session determines GPU and this task queues only its own prompts.")
+            return self.comfyui_port
+        if self._is_port_in_use(port):
+            raise ComfyUIError(f"Configured endpoint port {port} is occupied by an unverified service; refusing another port or replacement.")
+        self.LogInfo(f"Configured endpoint unavailable; fallback will start only at {endpoint}.")
+        return self.comfyui_port
 
     def _determine_final_port(self, base_port: int) -> str:
         """Determine final port to use, checking for existing instances"""
@@ -461,6 +580,7 @@ class ComfyUI(DeadlinePlugin):
         
         try:
             self._setup_batch_processing()
+            self._load_worker_endpoint_policy()
             comfyui_path = self._resolve_comfyui_install_path()
             if not comfyui_path:
                 raise ComfyUIError("ComfyUI installation path could not be resolved.")
@@ -583,7 +703,8 @@ class ComfyUI(DeadlinePlugin):
 
     def _create_dummy_command(self) -> str:
         """Create dummy command for existing ComfyUI instances"""
-        self.LogInfo("Using existing ComfyUI instance - returning dummy command.")
+        self.reuse_completion_marker = os.path.join(self.temp_dir, "comfyui_reuse_completion.json")
+        self.LogInfo("Using existing ComfyUI instance - starting own-prompt waiter.")
         
         # Start workflow submission thread
         workflow_thread = threading.Thread(target=self.submit_workflow)
@@ -591,21 +712,27 @@ class ComfyUI(DeadlinePlugin):
         workflow_thread.start()
         
         dummy_script = self._get_dummy_script()
-        return f'-c "{dummy_script}"'
+        encoded = base64.b64encode(dummy_script.encode("utf-8")).decode("ascii")
+        return f'-c "import base64;exec(base64.b64decode(\'{encoded}\'))"'
 
     def _get_dummy_script(self) -> str:
-        """Get dummy Python script for workflow waiting"""
-        return """
-import time, os, sys
-print('Waiting for ComfyUI workflow to complete via API...')
-max_wait = 600  # 10 minute timeout
-for i in range(max_wait):
-    if i % 10 == 0:
-        progress_val = float(os.environ.get('DEADLINE_TASK_PROGRESS', i * (100.0 / max_wait)))
-        print(f'Progress: {progress_val:.1f}%')
+        """Wait for this task's completion marker; Deadline cancellation remains authoritative."""
+        return """import json, os, sys, time
+marker = %r
+while not os.path.exists(marker):
     time.sleep(1)
-print('Dummy command timeout reached or task completed.')
-"""
+with open(marker, 'r') as handle:
+    result = json.load(handle)
+os.remove(marker)
+sys.exit(0 if result.get('success') else 1)
+""" % self.reuse_completion_marker
+
+    def _signal_reuse_waiter(self, success):
+        if self.reuse_completion_marker:
+            temp_marker = self.reuse_completion_marker + ".tmp"
+            with open(temp_marker, "w") as handle:
+                json.dump({"success": bool(success)}, handle)
+            os.replace(temp_marker, self.reuse_completion_marker)
 
     def _build_comfyui_arguments(self, comfyui_main_py: str) -> str:
         """Build command line arguments for new ComfyUI instance"""
@@ -1255,6 +1382,8 @@ print('Dummy command timeout reached or task completed.')
     def _prepare_variation_prompt(self, workflow_data: dict, variation_index: int):
         """Deep-copy and rewrite Deadline seed nodes for one global variation index."""
         prompt_workflow = copy.deepcopy(workflow_data)
+        if self.use_existing_comfyui:
+            self._stage_reused_endpoint_inputs(prompt_workflow)
         seeds = []
 
         for node_id, node in prompt_workflow.items():
@@ -1290,6 +1419,34 @@ print('Dummy command timeout reached or task completed.')
 
         workflow_metadata = self._prepare_standard_workflow_metadata(seeds)
         return prompt_workflow, metadata, workflow_metadata
+
+    def _stage_reused_endpoint_inputs(self, workflow):
+        """Stage only proven task inputs beneath the existing GUI input root."""
+        if not self.comfyui_input_dir:
+            return
+        root = os.path.normcase(os.path.abspath(self.comfyui_input_dir))
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs", {})
+            for key, value in list(inputs.items()):
+                if not isinstance(value, str) or os.path.isabs(value):
+                    continue
+                candidate = os.path.normcase(os.path.abspath(os.path.join(root, value)))
+                if candidate.startswith(root + os.sep) and os.path.isfile(candidate):
+                    task_root = os.path.join(self.reuse_gui_input_root, "deadline", self.submission_id or uuid.uuid4().hex)
+                    relative = os.path.relpath(candidate, root)
+                    destination = os.path.normcase(os.path.abspath(os.path.join(task_root, relative)))
+                    gui_root = os.path.normcase(os.path.abspath(self.reuse_gui_input_root))
+                    if not destination.startswith(gui_root + os.sep):
+                        raise ComfyUIError("Unsafe GUI input staging path.")
+                    try:
+                        os.makedirs(os.path.dirname(destination), exist_ok=True)
+                        shutil.copy2(candidate, destination)
+                    except OSError as e:
+                        raise ComfyUIError(f"Could not stage reused endpoint input '{value}': {e}")
+                    inputs[key] = os.path.relpath(destination, gui_root).replace("\\", "/")
+                    self.LogInfo(f"Reused endpoint input staged under GUI input root: {inputs[key]}")
 
     def _prepare_standard_workflow_metadata(self, seeds: list):
         """Patch the UI workflow metadata so dropped output images reopen the actual variation."""
@@ -1364,12 +1521,44 @@ print('Dummy command timeout reached or task completed.')
         if output_nodes:
             self.LogInfo(f"Output producing nodes: {output_nodes}")
 
+        if self.use_existing_comfyui and self.custom_output_dir_specified:
+            gui_output = self.reuse_gui_output_root
+            output_root = os.path.normcase(os.path.abspath(gui_output))
+            target_root = os.path.normcase(os.path.abspath(self.comfyui_output_dir))
+            copied = 0
+            for node_outputs in outputs.values():
+                for group in ("images", "gifs", "videos"):
+                    for item in node_outputs.get(group, []):
+                        if item.get("type", "output") != "output":
+                            continue
+                        filename = item.get("filename")
+                        if not filename:
+                            continue
+                        relative = os.path.join(item.get("subfolder", ""), filename)
+                        source = os.path.normcase(os.path.abspath(os.path.join(gui_output, relative)))
+                        target = os.path.normcase(os.path.abspath(os.path.join(self.comfyui_output_dir, relative)))
+                        if not source.startswith(output_root + os.sep) or not target.startswith(target_root + os.sep):
+                            raise ComfyUIError(f"ComfyUI history returned unsafe output path: {relative}")
+                        if not os.path.isfile(source):
+                            raise ComfyUIError(f"Expected this task's output is missing from GUI endpoint: {relative}")
+                        try:
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            shutil.copy2(source, target)
+                        except OSError as e:
+                            raise ComfyUIError(f"Could not copy this task's GUI output '{relative}': {e}")
+                        copied += 1
+                        self.LogInfo(f"Copied this task's GUI output to job directory: {relative}")
+            if copied == 0:
+                raise ComfyUIError("Reused endpoint completed without an output file recorded for this task.")
+
     def _complete_task(self):
         """Mark task as complete"""
         self.SetProgress(100)
         self.SetStatusMessage("Finished Render")
         self.task_completed = True
         self.LogInfo(f"All {self.chunk_size} prompt(s) in this task completed")
+        if self.use_existing_comfyui:
+            self._signal_reuse_waiter(True)
 
     def _move_to_next_prompt(self):
         """Move to tracking the next prompt"""
@@ -1471,7 +1660,8 @@ print('Dummy command timeout reached or task completed.')
                     self.LogInfo("Distributed worker mode: Registration completed, entering keep-alive mode")
                     self._enter_distributed_keep_alive_mode()
                 else:
-                    self.signal_task_completion()
+                    if not self.use_existing_comfyui:
+                        self.signal_task_completion()
                 return True
             
             if self.prompt_id:
@@ -1495,7 +1685,8 @@ print('Dummy command timeout reached or task completed.')
                 self._enter_distributed_keep_alive_mode()
             else:
                 # Normal mode - complete the task
-                self.signal_task_completion()
+                if not self.use_existing_comfyui:
+                    self.signal_task_completion()
         
         return self.task_completed
 
@@ -1586,15 +1777,15 @@ print('Dummy command timeout reached or task completed.')
         try:
             workflow_data = self.load_and_validate_workflow()
             if not workflow_data:
-                return
+                raise ComfyUIError("Workflow could not be loaded or validated.")
 
             self._load_standard_workflow_metadata()
             
             if not self.initialize_api_connection():
-                return
+                raise ComfyUIError("Could not initialize the ComfyUI API connection.")
             
             if not self.queue_workflow(workflow_data):
-                return
+                raise ComfyUIError("ComfyUI did not accept this task's prompt.")
             
             self.monitor_workflow_execution()
             
@@ -1603,6 +1794,7 @@ print('Dummy command timeout reached or task completed.')
             traceback.print_exc()
             self.thread_running = False
             self.task_completed = False
+            self._signal_reuse_waiter(False)
             # FailRender only raises on this Python thread. AbortRender signals
             # the managed-process loop so Deadline stops it and records an error.
             self.AbortRender(f"Error during workflow submission: {str(e)}")

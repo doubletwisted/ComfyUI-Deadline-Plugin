@@ -51,6 +51,12 @@ D:\Apps\ComfyUI
 
 Workers try those paths in order and use the first one that contains `ComfyUI\main.py` and `python_embeded\python.exe`.
 
+## Reusing a worker's GUI session
+
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+
+Endpoint reuse is intentionally rejected for jobs that require a staged input folder or custom output folder, because a GUI session was not started with those paths. Such jobs use the configured fallback launch instead.
+
 ## Use It
 
 Add `Submit to Deadline` to your workflow, set `output_directory` to a path the farm can see, and run the workflow in ComfyUI.
@@ -110,3 +116,5 @@ python \\YOUR-SERVER\share\scripts\maintenance\submit_comfy_sync.py --type model
 - This targets portable Windows ComfyUI workers.
 - Deadline handles render timeouts. Set those in Deadline Monitor.
 - The old fake `/deadline/*` API routes are gone from this plugin. If you use `ComfyUI-Deadline-Distributed`, it owns its own routes.
+
+Run the endpoint-policy regression tests with `python tests/test_reuse_endpoint.py`.

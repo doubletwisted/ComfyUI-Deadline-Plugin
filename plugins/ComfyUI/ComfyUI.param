@@ -30,4 +30,12 @@ Label=Default Output Directory (Optional)
 Category=Configuration
 Index=1
 Default=
-Description=Optional default output directory. If blank, uses ComfyUI's default output folder. This can be overridden per job. 
+Description=Optional default output directory. If blank, uses ComfyUI's default output folder. This can be overridden per job.
+
+[ComfyUIWorkerEndpoints]
+Type=multilinestring
+Label=Per-Worker ComfyUI Endpoints
+Category=Configuration
+Index=2
+Default={}
+Description=Optional JSON keyed by worker name. Example: {"M28":{"ComfyUIApiUrl":"http://127.0.0.1:8188","LaunchGpuUuid":"GPU-..."}}. A verified endpoint is reused; fallback launches only at that port and resolves the UUID.
