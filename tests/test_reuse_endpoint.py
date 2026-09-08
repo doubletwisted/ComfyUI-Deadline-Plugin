@@ -362,16 +362,19 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
             plugin._signal_reuse_waiter(True)
             self.assertEqual(json.loads(Path(marker).read_text()), {"success": True})
 
-    def test_known_bug_submit_failure_does_not_signal_waiter(self):
-        """Regression detector: current source leaves the dummy process waiting."""
+    def test_submit_failure_releases_waiter_and_fails_deadline_task(self):
         with tempfile.TemporaryDirectory() as temp:
             plugin = new_plugin(reuse_completion_marker=os.path.join(temp, "marker.json"))
             plugin.load_and_validate_workflow = lambda: (_ for _ in ()).throw(ComfyUIError("synthetic queue failure"))
             plugin.AbortRender = lambda message: plugin.logs.append(("abort", message))
             signaled = []
+            failed = []
             plugin._signal_reuse_waiter = lambda success: signaled.append(bool(success))
+            plugin.signal_task_failure = lambda message: failed.append(message)
             plugin.submit_workflow()
             self.assertEqual(signaled, [False], "failure must release the Deadline dummy waiter")
+            self.assertEqual(len(failed), 1, "failure must be handed to Deadline's task state")
+            self.assertIn("synthetic queue failure", failed[0])
 
 
 if __name__ == "__main__":

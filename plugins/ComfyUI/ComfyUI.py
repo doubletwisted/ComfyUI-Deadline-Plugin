@@ -170,6 +170,7 @@ class ComfyUI(DeadlinePlugin):
         self.endpoint_session_id = ""
         self.object_info = None
         self.expected_outputs_by_prompt = {}
+        self.submission_error = ""
         
         # Batch processing variables
         self.chunk_size = 1
@@ -721,7 +722,7 @@ class ComfyUI(DeadlinePlugin):
         self.LogInfo("ComfyUI PostRenderTasks started.")
 
         if not self.task_completed:
-            message = (
+            message = self.submission_error or (
                 f"ComfyUI process ended before this Deadline task completed on worker {self.GetSlaveName()}; "
                 f"server_started={self.server_started}, workflow_submitted={self.workflow_submitted}, "
                 f"completed_prompts={self.prompts_executed}/{self.chunk_size}."
@@ -1973,6 +1974,25 @@ sys.exit(0 if result.get('success') else 1)
             self.LogWarning(f"Error signaling task completion: {e}")
             self.LogWarning(traceback.format_exc())
 
+    def signal_task_failure(self, message):
+        """Fail the active repository task from the submission thread."""
+        try:
+            job = self.GetJob()
+            task_id = self.GetCurrentTaskId()
+            slave_name = self.GetSlaveName()
+            tasks = RepositoryUtils.GetJobTasks(job, True)
+            current_task = self._find_current_task(tasks, task_id)
+            if current_task:
+                self.LogWarning(
+                    f"Failing Deadline task {current_task.TaskID} on {slave_name}: {message}"
+                )
+                RepositoryUtils.FailTasks(job, [current_task], slave_name)
+            else:
+                self.LogWarning(f"Could not find task {task_id} to fail: {message}")
+        except Exception as e:
+            self.LogWarning(f"Error signaling task failure: {e}")
+            self.LogWarning(traceback.format_exc())
+
     def _find_current_task(self, tasks, task_id):
         """Find the current task in the task list"""
         for task in tasks:
@@ -2131,11 +2151,13 @@ sys.exit(0 if result.get('success') else 1)
             self.monitor_workflow_execution()
             
         except Exception as e:
-            self.LogWarning(f"Error during workflow submission: {e}")
+            self.submission_error = f"Error during workflow submission: {str(e)}"
+            self.LogWarning(self.submission_error)
             traceback.print_exc()
             self.thread_running = False
             self.task_completed = False
             self._signal_reuse_waiter(False)
-            # FailRender only raises on this Python thread. AbortRender signals
-            # the managed-process loop so Deadline stops it and records an error.
-            self.AbortRender(f"Error during workflow submission: {str(e)}")
+            # Deadline render callbacks run on this background thread. Explicitly
+            # fail the repository task so an exception here cannot leave it active.
+            self.signal_task_failure(self.submission_error)
+            self.AbortRender(self.submission_error)
