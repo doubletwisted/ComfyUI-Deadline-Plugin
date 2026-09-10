@@ -469,8 +469,14 @@ class ComfyUI(DeadlinePlugin):
 
     def _calculate_comfyui_port(self) -> str:
         """Calculate the port for ComfyUI based on CUDA device"""
-        if self.endpoint_policy_active:
+        worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
+        if self.endpoint_policy_active and not (worker_mode or distributed_mode or force_new_instance):
             return self._configure_policy_endpoint()
+        if self.endpoint_policy_active:
+            self.LogInfo(
+                "Ignoring reusable endpoint policy because this job requires an isolated "
+                "ComfyUI process (worker/distributed/force-new mode)."
+            )
         cuda_arg = self._get_cuda_device_arg()
         cuda_device_id = None
         

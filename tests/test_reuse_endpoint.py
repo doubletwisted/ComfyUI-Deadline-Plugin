@@ -199,6 +199,18 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
         self.assertEqual(plugin.comfyui_port, "8188")
         self.assertEqual(plugin.endpoint_session_id, "session-a")
 
+    def test_distributed_job_ignores_reusable_endpoint_policy(self):
+        flags = {"WorkerMode": True, "DistributedMode": True, "ForceNewInstance": True}
+        plugin = new_plugin(
+            endpoint_policy_active=True,
+            GetBooleanPluginInfoEntryWithDefault=lambda key, default: flags.get(key, default),
+            _get_cuda_device_arg=lambda: "",
+            _determine_final_port=lambda base_port: str(base_port + 100),
+        )
+        plugin._configure_policy_endpoint = lambda: self.fail("distributed jobs must not reuse an endpoint")
+        self.assertEqual(plugin._calculate_comfyui_port(), "8288")
+        self.assertTrue(any("requires an isolated" in message for _, message in plugin.logs))
+
     def test_reuse_rejects_right_api_from_wrong_installation(self):
         plugin = new_plugin(
             comfyui_install_path=os.path.abspath("C:/Expected"),
