@@ -1606,11 +1606,24 @@ sys.exit(0 if result.get('success') else 1)
             if definition.get("output_node") and re.search(r"save|preview|video|image|audio", class_type, re.I):
                 expected_outputs.append(str(node_id))
 
-        if not expected_outputs:
+        worker_mode, distributed_mode, _ = get_distributed_config_for_plugin(self)
+        is_registration_prompt = (
+            worker_mode
+            and distributed_mode
+            and len(prompt) == 1
+            and next(iter(prompt.values())).get("class_type") == "DeadlineWorkerRegistration"
+        )
+        if not expected_outputs and not is_registration_prompt:
             raise ComfyUIError(
                 f"Headless preflight found no file-producing output node on worker {self.GetSlaveName()}."
             )
         self.current_prompt_payload = prompt
+        if is_registration_prompt:
+            self.LogInfo(
+                f"Headless preflight accepted the distributed worker registration prompt on "
+                f"{self.GetSlaveName()}; registration completes through ComfyUI history and does not write a file."
+            )
+            return prompt, expected_outputs
         self.LogInfo(
             f"Headless preflight passed for {len(prompt)} node(s) on worker {self.GetSlaveName()}; "
             f"expected output nodes: {', '.join(expected_outputs)}"

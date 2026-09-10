@@ -103,6 +103,7 @@ Every variation is checked on the selected Deadline worker after input staging, 
 - removes fixed `ImpactSwitch`, `LatentSwitch`, and `SEGSSwitch` pass-through nodes by reconnecting consumers to the selected upstream input;
 - sends the complete submitted `extra_pnginfo.workflow` to metadata-aware nodes;
 - verifies that ComfyUI history reports the expected output nodes and that every reported file exists;
+- permits the exact `DeadlineWorkerRegistration` control prompt when both worker and distributed modes are enabled; this prompt completes through history and intentionally produces no file;
 - turns prompt-validation errors, execution exceptions, early process exits, HTTP timeouts, missing output, and Deadline task timeouts into task failures.
 
 Dynamic/connected switch selections are not rewritten. Browser-driven chooser/picker/preview-bridge nodes (`FL_ImagePicker`, `easy imageChooser`, `ImageChooser`, `PreviewChooser`, `PreviewBridge`, and `ImpactPreviewBridge`) are rejected because a farm render has no user to answer them. Other nodes using `PROMPT`, `DYNPROMPT`, `UNIQUE_ID`, or `EXTRA_PNGINFO` remain supported when the worker has the node and the submission includes full workflow metadata. Unknown third-party interactive nodes cannot be identified from `/object_info` alone; add their exact `class_type` to `KNOWN_UI_DEPENDENT_NODE_TYPES` after confirming that they wait for frontend state.

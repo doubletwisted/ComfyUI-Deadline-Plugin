@@ -103,6 +103,7 @@ def new_plugin(**attrs):
     plugin.standard_workflow = None
     plugin.GetSlaveName = lambda: "M21"
     plugin.GetPluginInfoEntryWithDefault = lambda key, default: default
+    plugin.GetBooleanPluginInfoEntryWithDefault = lambda key, default: default
     plugin.LogInfo = lambda message: plugin.logs.append(("info", message))
     plugin.LogWarning = lambda message: plugin.logs.append(("warning", message))
     for key, value in attrs.items():

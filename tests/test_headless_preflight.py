@@ -33,6 +33,10 @@ def object_info():
         },
         "FL_ImagePicker": {"input": {"required": {}, "hidden": {"unique_id": "UNIQUE_ID"}}, "output_node": False},
         "Explode": {"input": {"required": {}, "hidden": {}}, "output_node": False},
+        "DeadlineWorkerRegistration": {
+            "input": {"required": {}, "optional": {}, "hidden": {}},
+            "output_node": True,
+        },
     }
 
 
@@ -92,6 +96,29 @@ class HeadlessPreflightTests(unittest.TestCase):
                     "7": {"class_type": "MissingOnWorker", "inputs": {}},
                     "2": {"class_type": "SaveImage", "inputs": {"images": ["7", 0]}},
                 }, WORKFLOW)
+
+    def test_distributed_worker_registration_does_not_require_a_file_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(Path(temp))
+            flags = {"WorkerMode": True, "DistributedMode": True}
+            plugin.GetBooleanPluginInfoEntryWithDefault = lambda key, default: flags.get(key, default)
+            prompt = {
+                "1": {"class_type": "DeadlineWorkerRegistration", "inputs": {}},
+            }
+            result, expected = plugin._preflight_worker_payload(prompt)
+            self.assertEqual(result, prompt)
+            self.assertEqual(expected, [])
+
+    def test_distributed_non_registration_prompt_still_requires_file_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(Path(temp))
+            flags = {"WorkerMode": True, "DistributedMode": True}
+            plugin.GetBooleanPluginInfoEntryWithDefault = lambda key, default: flags.get(key, default)
+            with self.assertRaisesRegex(ComfyUIError, "no file-producing output node"):
+                plugin._preflight_worker_payload({
+                    "1": {"class_type": "DeadlineWorkerRegistration", "inputs": {}},
+                    "3": {"class_type": "Explode", "inputs": {}},
+                })
 
     def test_invalid_staged_path_is_rejected_before_queue(self):
         with tempfile.TemporaryDirectory() as temp:
