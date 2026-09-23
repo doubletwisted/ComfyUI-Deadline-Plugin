@@ -31,6 +31,10 @@ def object_info():
             "input": {"required": {}, "hidden": {"extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"}},
             "output_node": False,
         },
+        "PrimitiveInt": {
+            "input": {"required": {"value": [["INT", {}]]}, "hidden": {}},
+            "output_node": False,
+        },
         "FL_ImagePicker": {"input": {"required": {}, "hidden": {"unique_id": "UNIQUE_ID"}}, "output_node": False},
         "Explode": {"input": {"required": {}, "hidden": {}}, "output_node": False},
         "DeadlineWorkerRegistration": {
@@ -78,6 +82,37 @@ class HeadlessPreflightTests(unittest.TestCase):
             self.assertNotIn("5", result)
             self.assertEqual(result["2"]["inputs"]["images"], ["4", 0])
             self.assertEqual(result["2"]["inputs"]["label"], "input2")
+
+    def test_switch_selection_from_fixed_primitive_is_resolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(Path(temp))
+            prompt = {
+                "3": {"class_type": "Explode", "inputs": {}},
+                "4": {"class_type": "Explode", "inputs": {}},
+                "5": {
+                    "class_type": "ImpactSwitch",
+                    "inputs": {"select": ["6", 0], "input1": ["3", 0], "input2": ["4", 0]},
+                },
+                "6": {"class_type": "PrimitiveInt", "inputs": {"value": 2}},
+                "2": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
+            }
+            result, _ = plugin._preflight_worker_payload(prompt, WORKFLOW)
+            self.assertNotIn("5", result)
+            self.assertEqual(result["2"]["inputs"]["images"], ["4", 0])
+
+    def test_dynamic_switch_value_node_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(Path(temp))
+            with self.assertRaisesRegex(ComfyUIError, "connected to a non-fixed value"):
+                plugin._preflight_worker_payload({
+                    "3": {"class_type": "Explode", "inputs": {}},
+                    "4": {"class_type": "Explode", "inputs": {}},
+                    "5": {
+                        "class_type": "ImpactSwitch",
+                        "inputs": {"select": ["3", 0], "input1": ["3", 0], "input2": ["4", 0]},
+                    },
+                    "2": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
+                }, WORKFLOW)
 
     def test_gui_dependent_node_is_rejected_with_context(self):
         with tempfile.TemporaryDirectory() as temp:

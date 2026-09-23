@@ -84,6 +84,21 @@ FIXED_SWITCH_SPECS = {
     "SEGSSwitch": {"select": "select", "input": "input{index}"},
 }
 
+# These nodes expose a literal value through output 0.  They are safe to
+# evaluate during submission because their value is part of the API prompt;
+# they do not depend on frontend interaction or worker runtime state.
+FIXED_VALUE_NODE_TYPES = {
+    "PrimitiveBoolean",
+    "PrimitiveFloat",
+    "PrimitiveInt",
+    "PrimitiveString",
+    "PrimitiveNode",
+    "easy boolean",
+    "easy float",
+    "easy int",
+    "easy string",
+}
+
 FILE_OUTPUT_GROUPS = ("images", "gifs", "videos", "audio")
 
 def get_distributed_config_for_plugin(plugin) -> Tuple[bool, bool, bool]:
@@ -1516,8 +1531,44 @@ sys.exit(0 if result.get('success') else 1)
     def _is_link(value):
         return isinstance(value, (list, tuple)) and len(value) == 2 and str(value[0]) != ""
 
+    def _resolve_fixed_value(self, prompt, value, workflow_metadata=None, visited=None):
+        """Resolve a switch selector connected to a literal-value node."""
+        if not self._is_link(value):
+            return value, None
+
+        source_id = str(value[0])
+        try:
+            output_index = int(value[1])
+        except (TypeError, ValueError):
+            return None, None
+        if output_index != 0:
+            return None, None
+
+        visited = set() if visited is None else set(visited)
+        if source_id in visited:
+            return None, None
+        visited.add(source_id)
+
+        source = prompt.get(source_id)
+        if not isinstance(source, dict) or source.get("class_type") not in FIXED_VALUE_NODE_TYPES:
+            return None, None
+
+        source_inputs = source.get("inputs", {})
+        if not isinstance(source_inputs, dict) or "value" not in source_inputs:
+            return None, None
+
+        resolved, resolved_from = self._resolve_fixed_value(
+            prompt,
+            source_inputs["value"],
+            workflow_metadata,
+            visited,
+        )
+        if resolved_from is None and resolved is not None:
+            resolved_from = source_id
+        return resolved, resolved_from
+
     def _resolve_fixed_switches(self, prompt, workflow_metadata=None):
-        """Remove supported constant-selection switches and reconnect consumers."""
+        """Remove supported fixed-selection switches and reconnect consumers."""
         for switch_id, switch in list(prompt.items()):
             if not isinstance(switch, dict):
                 continue
@@ -1527,13 +1578,21 @@ sys.exit(0 if result.get('success') else 1)
                 continue
             inputs = switch.get("inputs", {})
             raw_select = inputs.get(spec["select"])
-            if self._is_link(raw_select):
+            selected_index, selected_from = self._resolve_fixed_value(
+                prompt, raw_select, workflow_metadata
+            )
+            if selected_from is not None:
+                self.LogInfo(
+                    f"Headless preflight resolved {class_type} node {switch_id} "
+                    f"selection from fixed value node {selected_from}: {selected_index}."
+                )
+            elif self._is_link(raw_select):
                 raise ComfyUIError(
                     f"Headless preflight rejected dynamic switch {self._node_context(switch_id, prompt, workflow_metadata)}: "
-                    "the selection is connected and cannot be proven fixed."
+                    "the selection is connected to a non-fixed value."
                 )
             try:
-                selected_index = int(raw_select)
+                selected_index = int(selected_index)
             except (TypeError, ValueError):
                 raise ComfyUIError(
                     f"Headless preflight rejected {self._node_context(switch_id, prompt, workflow_metadata)}: "
