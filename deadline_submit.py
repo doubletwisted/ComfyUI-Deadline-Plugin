@@ -31,6 +31,17 @@ INPUT_LOADER_FIELDS = {
     "LoadImageMask": ("image",),
     "LoadAudio": ("audio",),
     "LoadVideo": ("file",),
+    # VideoHelperSuite file-based loaders.  Directory loaders such as
+    # VHS_LoadImagesPath intentionally remain unsupported here.
+    "VHS_LoadVideo": ("video",),
+    "VHS_LoadVideoFFmpeg": ("video",),
+    "VHS_LoadAudioUpload": ("audio",),
+}
+ABSOLUTE_FILE_LOADER_FIELDS = {
+    "VHS_LoadVideoPath": ("video",),
+    "VHS_LoadVideoFFmpegPath": ("video",),
+    "VHS_LoadImagePath": ("image",),
+    "VHS_LoadAudio": ("audio_file",),
 }
 MEDIA_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".exr",
@@ -183,13 +194,21 @@ class InputAssetStager:
 
         os.makedirs(staging_dir, exist_ok=True)
         assets = []
-        for original_rel_path, source_path in sorted(references.items()):
-            staged_rel_path, destination_path = self._resolve_destination(staging_dir, original_rel_path, source_path)
+        for original_reference, source_path in sorted(references.items()):
+            # Absolute-path loader nodes are converted to a farm-visible staged
+            # absolute path later.  Use only the basename inside the staging
+            # directory; never reproduce the submitter's local directory tree.
+            destination_rel_path = (
+                os.path.basename(source_path)
+                if os.path.isabs(original_reference)
+                else original_reference
+            )
+            staged_rel_path, destination_path = self._resolve_destination(staging_dir, destination_rel_path, source_path)
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
             if not os.path.exists(destination_path):
                 shutil.copy2(source_path, destination_path)
             assets.append({
-                "original_relative_path": original_rel_path.replace("\\", "/"),
+                "original_relative_path": original_reference.replace("\\", "/"),
                 "staged_relative_path": staged_rel_path.replace("\\", "/"),
                 "relative_path": staged_rel_path.replace("\\", "/"),
                 "source": source_path,
@@ -224,19 +243,23 @@ class InputAssetStager:
             if not isinstance(inputs, dict):
                 continue
 
-            candidate_values: List[Tuple[Any, bool]] = []
+            candidate_values: List[Tuple[Any, bool, bool]] = []
             for field_name in INPUT_LOADER_FIELDS.get(class_type, ()):
                 if field_name in inputs:
-                    candidate_values.append((inputs[field_name], True))
+                    candidate_values.append((inputs[field_name], True, False))
+
+            for field_name in ABSOLUTE_FILE_LOADER_FIELDS.get(class_type, ()):
+                if field_name in inputs:
+                    candidate_values.append((inputs[field_name], True, True))
 
             for value in inputs.values():
                 if isinstance(value, str):
-                    candidate_values.append((value, False))
+                    candidate_values.append((value, False, False))
 
-            for value, strict in candidate_values:
+            for value, strict, allow_absolute in candidate_values:
                 if not isinstance(value, str):
                     continue
-                resolved = self._resolve_input_file(value, input_dir, strict)
+                resolved = self._resolve_input_file(value, input_dir, strict, allow_absolute)
                 if not resolved:
                     continue
                 rel_path, source_path = resolved
@@ -255,14 +278,30 @@ class InputAssetStager:
         staged_rel_path = f"{stem}_{self.submission_id}{extension}"
         return staged_rel_path, os.path.abspath(os.path.join(staging_dir, staged_rel_path))
 
-    def _resolve_input_file(self, value: str, input_dir: str, strict: bool) -> Optional[Tuple[str, str]]:
+    def _resolve_input_file(
+        self,
+        value: str,
+        input_dir: str,
+        strict: bool,
+        allow_absolute: bool = False,
+    ) -> Optional[Tuple[str, str]]:
         clean_value, annotation = self._strip_annotation(value)
         if annotation in {"output", "temp"}:
             return None
-        if not clean_value or os.path.isabs(clean_value):
+        if not clean_value:
             return None
         if os.path.splitext(clean_value)[1].lower() not in MEDIA_EXTENSIONS:
             return None
+
+        if os.path.isabs(clean_value):
+            if not allow_absolute:
+                return None
+            candidate = os.path.abspath(clean_value)
+            if not os.path.isfile(candidate):
+                if not strict:
+                    return None
+                raise FileNotFoundError(f"Referenced input asset was not found: {value} ({candidate})")
+            return clean_value, candidate
 
         candidate = os.path.abspath(os.path.join(input_dir, clean_value))
         try:
@@ -577,7 +616,8 @@ class DeadlineSubmitNode:
             raise
 
     def _rewrite_prompt_asset_references(self, prompt: Dict[str, Any], assets: List[Dict[str, Any]]) -> None:
-        staged_by_original = self._asset_map(assets, "staged_relative_path")
+        staged_by_original = self._asset_map(assets, "staged_relative_path", allow_absolute=True)
+        staged_absolute_by_original = self._asset_map(assets, "destination", allow_absolute=True)
         if not staged_by_original:
             return
 
@@ -589,6 +629,12 @@ class DeadlineSubmitNode:
                 continue
 
             class_type = node.get("class_type", "")
+            for field_name in ABSOLUTE_FILE_LOADER_FIELDS.get(class_type, ()):
+                value = inputs.get(field_name)
+                normalized = self._normalize_asset_reference(value, allow_absolute=True)
+                if normalized in staged_absolute_by_original:
+                    inputs[field_name] = staged_absolute_by_original[normalized]
+
             for field_name in INPUT_LOADER_FIELDS.get(class_type, ()):
                 value = inputs.get(field_name)
                 normalized = self._normalize_asset_reference(value)
@@ -601,7 +647,7 @@ class DeadlineSubmitNode:
                     inputs[field_name] = staged_by_original[normalized]
 
     def _rewrite_standard_workflow_assets(self, workflow: Optional[Dict[str, Any]], assets: List[Dict[str, Any]]) -> None:
-        staged_absolute_by_original = self._asset_map(assets, "destination")
+        staged_absolute_by_original = self._asset_map(assets, "destination", allow_absolute=True)
         if not workflow or not staged_absolute_by_original:
             return
 
@@ -621,20 +667,27 @@ class DeadlineSubmitNode:
                 if normalized in staged_absolute_by_original:
                     widgets[index] = staged_absolute_by_original[normalized]
 
-    def _asset_map(self, assets: List[Dict[str, Any]], target_key: str) -> Dict[str, str]:
+    def _asset_map(
+        self,
+        assets: List[Dict[str, Any]],
+        target_key: str,
+        allow_absolute: bool = False,
+    ) -> Dict[str, str]:
         mapping = {}
         for asset in assets:
-            original = self._normalize_asset_reference(asset.get("original_relative_path"))
+            original = self._normalize_asset_reference(
+                asset.get("original_relative_path"), allow_absolute=allow_absolute
+            )
             target = asset.get(target_key)
             if original and target:
                 mapping[original] = target
         return mapping
 
-    def _normalize_asset_reference(self, value: Any) -> Optional[str]:
+    def _normalize_asset_reference(self, value: Any, allow_absolute: bool = False) -> Optional[str]:
         if not isinstance(value, str) or not value:
             return None
         cleaned = re.sub(r"\s+\[(input|output|temp)\]\s*$", "", value.strip())
-        if os.path.isabs(cleaned):
+        if os.path.isabs(cleaned) and not allow_absolute:
             return None
         return os.path.normpath(cleaned.replace("/", os.sep)).replace("\\", "/")
 

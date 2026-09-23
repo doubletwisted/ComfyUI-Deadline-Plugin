@@ -47,6 +47,16 @@ DEADLINE_SEED_NODE_TYPES = {"DeadlineSeed", "DeadlineDistributedSeed", "Distribu
 # Output node types that indicate the workflow will produce output
 OUTPUT_NODE_TYPES = ["SaveImage", "PreviewImage", "SaveVideo"]
 
+# File-based VideoHelperSuite upload nodes use the worker's configured
+# --input-directory just like the built-in loader nodes.  Path variants are
+# rewritten to an absolute staged file path by the submitter and are therefore
+# intentionally not listed here.
+STAGED_FILE_INPUTS = {
+    "VHS_LoadVideo": {"video"},
+    "VHS_LoadVideoFFmpeg": {"video"},
+    "VHS_LoadAudioUpload": {"audio"},
+}
+
 # Nodes in this set wait for a browser/client decision or consume state that is
 # only created by a frontend extension.  Metadata-aware save/display nodes are
 # deliberately not included: PROMPT, DYNPROMPT, UNIQUE_ID and EXTRA_PNGINFO are
@@ -1594,7 +1604,7 @@ sys.exit(0 if result.get('success') else 1)
                     is_staged_file = bool(options.get("image_upload")) or (
                         class_type in {"LoadImage", "LoadImageMask", "LoadAudio", "LoadVideo"}
                         and input_name in {"image", "audio", "video", "file"}
-                    )
+                    ) or input_name in STAGED_FILE_INPUTS.get(class_type, set())
                     value = node.get("inputs", {}).get(input_name)
                     if not is_staged_file or not isinstance(value, str):
                         continue

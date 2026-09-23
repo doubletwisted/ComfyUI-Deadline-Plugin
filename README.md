@@ -81,9 +81,9 @@ Normal ComfyUI loader nodes copy pasted or uploaded files into `ComfyUI/input`. 
 
 Workers start ComfyUI with that folder as `--input-directory`.
 
-Only files used by the submitted prompt are copied. If a file already exists and is identical, it is reused. If the name collides with a different file, the plugin gives the staged copy a unique suffix.
+Only files used by the submitted prompt are copied. This includes the built-in file loaders and VideoHelperSuite's `VHS_LoadVideo`, `VHS_LoadVideoFFmpeg`, and `VHS_LoadAudioUpload` nodes. VideoHelperSuite path nodes (`VHS_LoadVideoPath`, `VHS_LoadVideoFFmpegPath`, `VHS_LoadImagePath`, and `VHS_LoadAudio`) are also supported when they point to an existing media file; the submitted prompt is rewritten to the staged farm-visible file. If a file already exists and is identical, it is reused. If the name collides with a different file, the plugin gives the staged copy a unique suffix.
 
-Absolute path loader nodes are left alone. Those paths must already be valid on the farm.
+Directory loaders, including `VHS_LoadImagesPath`, are not copied. Absolute paths for unsupported nodes are left alone and must already be valid on the farm.
 
 ## Workflow Metadata
 
