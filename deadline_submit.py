@@ -574,7 +574,6 @@ class DeadlineSubmitNode:
             print(f"Deadline Submission: Submitted job {result} with {batch_count} variation(s), chunk size {chunk_size}, {len(assets)} staged asset(s).")
             return (result,)
         except Exception as exc:
-            print(f"Deadline Submission: Error during submission: {exc}")
             raise
 
     def _rewrite_prompt_asset_references(self, prompt: Dict[str, Any], assets: List[Dict[str, Any]]) -> None:
@@ -657,7 +656,10 @@ class DeadlineSubmitNode:
     def _prepare_output_directory(self, output_directory: str) -> str:
         output_directory = (output_directory or "").strip().strip("\"")
         if not output_directory:
-            raise ValueError("output_directory is required and must be farm-visible.")
+            raise ValueError(
+                "Set DeadlineSubmit output_directory to a shared farm path, "
+                "e.g. \\\\server\\share\\output."
+            )
 
         output_directory = os.path.abspath(os.path.expandvars(output_directory))
         os.makedirs(output_directory, exist_ok=True)
