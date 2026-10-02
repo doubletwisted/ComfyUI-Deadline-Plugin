@@ -1,6 +1,7 @@
 # ComfyUI Deadline Plugin
 
 Submit ComfyUI jobs to Thinkbox Deadline from inside ComfyUI.
+Check out https://github.com/doubletwisted/ComfyUI-Deadline-Distributed 
 
 Quick demo:
 
