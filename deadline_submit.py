@@ -7,6 +7,7 @@ prompt, stages referenced input assets, and submits a render job to Deadline.
 
 import copy
 import filecmp
+import hashlib
 import json
 import os
 import re
@@ -96,7 +97,7 @@ class DeadlineCommandHelper:
         return ""
 
     @staticmethod
-    def call_deadline_command(arguments: List[str], hide_window: bool = True) -> str:
+    def call_deadline_command(arguments: List[str], hide_window: bool = True, timeout: float = 60) -> str:
         deadline_command = DeadlineCommandHelper.get_deadline_command()
         if not deadline_command:
             raise RuntimeError("Deadline command not found. Set DEADLINE_PATH or install Deadline Client.")
@@ -119,7 +120,12 @@ class DeadlineCommandHelper:
             startupinfo=startupinfo,
             creationflags=creationflags,
         )
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise TimeoutError("Deadline command timed out; submission outcome may be unconfirmed") from None
         output = stdout.decode(errors="replace") if isinstance(stdout, bytes) else str(stdout)
         errors = stderr.decode(errors="replace") if isinstance(stderr, bytes) else str(stderr)
 
@@ -171,10 +177,13 @@ class WorkflowProcessor:
 
 
 class InputAssetStager:
-    def __init__(self, output_directory: str, job_name: str, submission_id: str):
+    def __init__(self, output_directory: str, job_name: str, submission_id: str, staging_directory: Optional[str] = None, input_directory: Optional[str] = None, native_assets: bool = False):
         self.output_directory = os.path.abspath(output_directory)
         self.job_name = job_name
         self.submission_id = submission_id
+        self.staging_directory = staging_directory
+        self.input_directory = input_directory
+        self.native_assets = native_assets
 
     def stage_referenced_assets(self, prompt: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, Any]]]:
         input_dir = self._get_local_input_directory()
@@ -203,10 +212,29 @@ class InputAssetStager:
                 if os.path.isabs(original_reference)
                 else original_reference
             )
+            if self.native_assets:
+                # Results added back to a workflow already have a deep run/
+                # attempt namespace. Keep retained native inputs shallow so
+                # Deadline's Python can open them on Windows. Content naming
+                # is stable when retry reads the previously staged copy.
+                checksum = hashlib.sha256()
+                with open(source_path, "rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        checksum.update(block)
+                destination_rel_path = checksum.hexdigest()[:24] + os.path.splitext(source_path)[1].lower()
             staged_rel_path, destination_path = self._resolve_destination(staging_dir, destination_rel_path, source_path)
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
             if not os.path.exists(destination_path):
-                shutil.copy2(source_path, destination_path)
+                fd, temporary = tempfile.mkstemp(prefix="stage-", suffix=".tmp", dir=os.path.dirname(destination_path))
+                os.close(fd)
+                try:
+                    shutil.copy2(source_path, temporary)
+                    if not filecmp.cmp(source_path, temporary, shallow=False):
+                        raise RuntimeError(f"Input changed while staging: {source_path}")
+                    os.replace(temporary, destination_path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
             assets.append({
                 "original_relative_path": original_reference.replace("\\", "/"),
                 "staged_relative_path": staged_rel_path.replace("\\", "/"),
@@ -226,6 +254,8 @@ class InputAssetStager:
         return staging_dir, manifest_path, assets
 
     def _get_local_input_directory(self) -> str:
+        if self.input_directory is not None:
+            return os.path.abspath(self.input_directory)
         try:
             import folder_paths
             return os.path.abspath(folder_paths.get_input_directory())
@@ -276,6 +306,9 @@ class InputAssetStager:
 
         stem, extension = os.path.splitext(rel_path)
         staged_rel_path = f"{stem}_{self.submission_id}{extension}"
+        alternative = os.path.join(staging_dir, staged_rel_path)
+        if os.path.exists(alternative) and not filecmp.cmp(source_path, alternative, shallow=False):
+            staged_rel_path = f"{stem}_{self.submission_id}_{uuid.uuid4().hex[:8]}{extension}"
         return staged_rel_path, os.path.abspath(os.path.join(staging_dir, staged_rel_path))
 
     def _resolve_input_file(
@@ -287,7 +320,12 @@ class InputAssetStager:
     ) -> Optional[Tuple[str, str]]:
         clean_value, annotation = self._strip_annotation(value)
         if annotation in {"output", "temp"}:
-            return None
+            if not self.native_assets:
+                return None
+            import folder_paths
+            input_dir = os.path.abspath(folder_paths.get_output_directory() if annotation == "output" else folder_paths.get_temp_directory())
+        if self.native_assets and strict:
+            allow_absolute = True
         if not clean_value:
             return None
         if os.path.splitext(clean_value)[1].lower() not in MEDIA_EXTENSIONS:
@@ -325,6 +363,8 @@ class InputAssetStager:
         return match.group(1).strip().replace("/", os.sep), match.group(2)
 
     def _staging_directory(self) -> str:
+        if self.staging_directory is not None:
+            return os.path.abspath(self.staging_directory)
         parent = os.path.dirname(self.output_directory.rstrip("\\/"))
         return os.path.join(parent, "input")
 

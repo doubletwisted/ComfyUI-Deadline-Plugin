@@ -278,6 +278,9 @@ class ComfyUI(DeadlinePlugin):
 
     def Cleanup(self):
         """Clean up plugin resources"""
+        if getattr(self, "native_spec", None):
+            import native_queue_task
+            native_queue_task.cleanup(self)
         self.thread_running = False
         
         # Clean up callbacks
@@ -704,6 +707,17 @@ class ComfyUI(DeadlinePlugin):
 
     def PreRenderTasks(self):
         """Setup tasks before rendering"""
+        if self.GetPluginInfoEntryWithDefault("NativeQueueProtocol", ""):
+            if self.GetPluginInfoEntryWithDefault("NativeQueueProtocol", "") != "1":
+                raise ComfyUIError("Unsupported native queue protocol")
+            # Deadline copies helpers but does not add the sandbox directory
+            # to Python's import path. Scope this to the explicit native mode.
+            helper_directory = os.path.dirname(os.path.abspath(__file__))
+            if helper_directory not in sys.path:
+                sys.path.insert(0, helper_directory)
+            import native_queue_task
+            native_queue_task.prepare(self)
+            return
         self.LogInfo("ComfyUI PreRenderTasks started.")
         
         try:
@@ -750,6 +764,14 @@ class ComfyUI(DeadlinePlugin):
 
     def PostRenderTasks(self):
         """Cleanup tasks after rendering"""
+        if getattr(self, "native_spec", None):
+            from farm_protocol import RunStore
+            import native_queue_task
+            native_queue_task.cleanup(self)
+            state = RunStore(self.native_spec["root"]).control(self.native_spec["run_id"])
+            if not state.get("result") and not state.get("cancel_requested"):
+                self.FailRender("Native task ended without a committed result")
+            return
         self.LogInfo("ComfyUI PostRenderTasks started.")
 
         if not self.task_completed:
@@ -820,6 +842,9 @@ class ComfyUI(DeadlinePlugin):
 
     def RenderArgument(self):
         """Build command line arguments for ComfyUI"""
+        if getattr(self, "native_spec", None):
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_queue_task.py")
+            return subprocess.list2cmdline(["-s", script, self.native_spec_path])
         comfyui_path = self._resolve_comfyui_install_path()
         if not comfyui_path:
             return ""

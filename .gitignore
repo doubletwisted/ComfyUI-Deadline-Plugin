@@ -137,6 +137,10 @@ user/
 
 # Deadline specific
 *.deadline
+deadline_native_settings.json
+work/
+scripts/*_spike.py
+scripts/m0_session_plugin/
 
 # OS specific
 .DS_Store
@@ -153,4 +157,4 @@ Thumbs.db
 
 # Logs
 *.log
-logs/ 
+logs/

@@ -177,5 +177,15 @@ if (!$NoBackup -and (Test-Path -LiteralPath $destinationPluginDirectory)) {
 
 Copy-PluginDirectory -SourceDirectory $sourcePluginDirectory -DestinationDirectory $destinationPluginDirectory -ShouldClean ([bool]$Clean)
 
+# The same protocol implementation must be importable inside Deadline's copied
+# sandbox. Do not depend on a submitting workstation's custom-node sys.path.
+if ($PluginName -eq "ComfyUI") {
+    foreach ($helper in @("farm_protocol.py", "farm_session_owner.py")) {
+        if ($PSCmdlet.ShouldProcess($destinationPluginDirectory, "Copy native queue helper $helper")) {
+            Copy-Item -LiteralPath (Join-Path $projectRoot $helper) -Destination (Join-Path $destinationPluginDirectory $helper) -Force
+        }
+    }
+}
+
 Write-Step "Deploy complete."
 Write-Step "If workers have cached the old plugin, restart them or submit a new job so Deadline copies the updated plugin sandbox."

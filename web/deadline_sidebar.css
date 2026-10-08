@@ -1,0 +1,65 @@
+.deadline-sidebar {
+    --dl-accent: var(--p-primary-color, #b1a0ed);
+    --dl-border: var(--border-color, #3b3b40);
+    --dl-muted: var(--descrip-text, #aaaab2);
+    height: 100%; min-height: 0; display: flex; flex-direction: column;
+    background: var(--comfy-menu-bg, #202023); color: var(--input-text, #e4e4e7);
+    font: 12px/1.5 system-ui, sans-serif; overflow: hidden;
+}
+.deadline-sidebar * {box-sizing: border-box;}
+.deadline-sidebar [hidden] {display: none !important;}
+.deadline-sidebar h2, .deadline-sidebar h3, .deadline-sidebar p {margin: 0;}
+.deadline-sidebar h2 {font-size: 17px; font-weight: 600;}
+.deadline-sidebar h3 {font-size: 12px; font-weight: 600; margin-bottom: 12px;}
+.deadline-sidebar small {display: block; color: var(--dl-muted); font-size: 11px;}
+.deadline-sidebar button, .deadline-sidebar input, .deadline-sidebar select {font: inherit; color: inherit;}
+.deadline-sidebar button {border: 1px solid var(--dl-border); border-radius: 5px; background: var(--comfy-input-bg, #29292e); padding: 7px 10px; cursor: pointer;}
+.deadline-sidebar button:hover:not(:disabled) {border-color: var(--dl-accent);}
+.deadline-sidebar button:disabled {opacity: .45; cursor: default;}
+.deadline-sidebar :focus-visible {outline: 2px solid var(--dl-accent); outline-offset: 2px;}
+.deadline-sidebar input:not([type=checkbox]), .deadline-sidebar select {width: 100%; min-width: 0; padding: 7px 8px; margin-top: 5px; border: 1px solid var(--dl-border); border-radius: 5px; background: var(--comfy-input-bg, #19191d);}
+.deadline-sidebar input[type=checkbox] {width: 14px; height: 14px; margin: 3px 0 0; accent-color: var(--dl-accent); flex-shrink: 0;}
+.deadline-sidebar label {display: block; color: var(--dl-muted); font-size: 11px;}
+.dl-header {display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; padding: 15px 16px; border-bottom: 1px solid var(--dl-border);}
+.dl-header button {width: 30px; height: 30px; padding: 0;}
+.dl-connection {display: flex; align-items: center; gap: 6px; color: var(--dl-muted); font-size: 10px; margin-top: 2px;}
+.dl-connection-dot {width: 5px; height: 5px; border-radius: 50%; background: #d29b5c;}
+.dl-connection[data-connected=true] .dl-connection-dot {background: #76c99d;}
+.dl-content {flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 18px 16px;}
+.dl-grid {display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;}
+.dl-destination-summary {font-size: 11px; margin-top: 12px !important;}
+.dl-destination-note {margin-top: 3px;}
+.dl-plugin-override {margin-top: 6px; font-size: 10px !important;}
+.dl-priority {margin-top: 23px;}
+.dl-priority label {max-width: 115px;}
+.dl-content details {border-top: 1px solid var(--dl-border); margin-top: 23px; padding-top: 12px;}
+.dl-content summary {cursor: pointer; font-size: 11px; color: var(--dl-muted);}
+.dl-more > label {margin-top: 14px;}
+.dl-content .dl-restriction {border: 0; padding-top: 0; margin-top: 18px;}
+.dl-restriction-summary {float: right; font-size: 10px;}
+.dl-restriction > small {margin-top: 10px;}
+.dl-search {margin: 8px 0 10px !important;}
+.deadline-sidebar .dl-clear-workers {padding: 0; border: 0; background: transparent; font-size: 11px; color: var(--dl-accent); margin-bottom: 10px;}
+.deadline-sidebar .dl-worker {display: flex; align-items: flex-start; gap: 9px; padding: 9px 0; border-top: 1px solid var(--dl-border); cursor: pointer;}
+.dl-worker > span:first-of-type {flex: 1; min-width: 0; overflow-wrap: anywhere;}
+.dl-worker strong {color: var(--input-text, #e4e4e7); font-size: 11px; font-weight: 500;}
+.dl-worker small {font-size: 10px; margin-top: 2px;}
+.dl-worker[data-invalid=true] small {color: #d9a768;}
+.dl-worker-status {font-size: 10px; white-space: nowrap;}
+.dl-worker-status[data-state=idle] {color: #76c99d;}
+.dl-worker-status[data-state=busy] {color: var(--dl-accent);}
+.dl-no-workers {color: var(--dl-muted); margin-top: 8px !important; font-size: 11px;}
+.dl-notice {margin-bottom: 20px; border-left: 2px solid #d9a768; padding: 2px 0 2px 10px;}
+.dl-notice strong {font-size: 12px; font-weight: 600;}
+.dl-notice p {margin-top: 4px !important; color: var(--dl-muted); font-size: 11px; overflow-wrap: anywhere;}
+.dl-guide-link {display: inline-block; color: var(--dl-accent); margin-top: 8px; font-size: 11px; text-decoration: none;}
+.deadline-sidebar .dl-review-workers {padding: 0; border: 0; background: transparent; color: var(--dl-accent); margin-top: 8px; font-size: 11px;}
+.deadline-sidebar footer {flex-shrink: 0; padding: 10px 16px 14px; border-top: 1px solid var(--dl-border);}
+.dl-buttons {display: flex; gap: 8px;}
+.dl-buttons button {min-width: 0; flex: .65; font-size: 11px;}
+.deadline-sidebar .dl-run {flex: 1.8; background: var(--dl-accent); color: #211b35; border-color: transparent; font-weight: 600;}
+.dl-run i {font-size: 10px;}
+.dl-error {font-size: 11px; color: #ef9292; overflow-wrap: anywhere; margin-bottom: 8px !important;}
+.dl-save-state:empty {display: none;}
+.dl-save-state {font-size: 10px !important; margin-bottom: 6px;}
+.dl-reload, .dl-retry-save {margin-bottom: 8px;}

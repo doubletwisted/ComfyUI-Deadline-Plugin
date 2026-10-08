@@ -39,3 +39,19 @@ Category=Configuration
 Index=2
 Default={}
 Description=Optional JSON keyed by worker name. Example: {"M28":{"ComfyUIApiUrl":"http://127.0.0.1:8188","LaunchGpuUuid":"GPU-..."}}. A verified endpoint is reused; fallback launches only at that port and resolves the UUID.
+
+[NativeWorkerSessions]
+Type=multilinestring
+Label=Native Queue Session Owners
+Category=Configuration
+Index=3
+Default={}
+Description=JSON keyed by Deadline Worker. Each entry contains a loopback broker and stable gpu_uuid. Example: {"M28":{"broker":"http://127.0.0.1:8202","gpu_uuid":"GPU-..."}}. Install the session owner independently with scripts/install_native_session.ps1. Warm mode requires exclusive ComfyUI Workers.
+
+[NativeQueueRoot]
+Type=filename
+Label=Native Queue Shared Storage
+Category=Configuration
+Index=4
+Default=
+Description=Off-host UNC folder for durable native queue runs, inputs and results. Submission and Worker accounts need read/write access. Normal tasks use the configured ComfyUI installation and Deadline GPU affinity; session owners are optional.

@@ -18,6 +18,8 @@ This plugin adds two nodes:
 
 The submitter does not render the workflow locally. It only packages the job and sends it to Deadline.
 
+The **Deadline** sidebar selects a pool, group and priority, with an optional Worker restriction. **Run (Deadline)** submits through ComfyUI's native Run controls and displays farm work in the existing Jobs panel. Accepted runs survive submitter shutdown. See [native queue setup and limits](docs/DEADLINE_NATIVE_QUEUE.md) and [live validation](docs/NATIVE_QUEUE_VALIDATION.md).
+
 ## Install
 
 Clone this into `ComfyUI/custom_nodes`:
