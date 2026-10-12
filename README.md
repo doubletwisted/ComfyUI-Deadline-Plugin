@@ -105,7 +105,7 @@ The worker writes the normal workflow metadata back into the output image when C
 
 Every variation is checked on the selected Deadline worker after input staging, seed expansion, and fixed-switch resolution. The worker:
 
-- validates every `class_type` against that worker's live `/object_info`;
+- validates every `class_type` using that worker's `/object_info/<class_type>` endpoint, requesting only node types present in the workflow;
 - rejects missing staged inputs and known browser-interactive nodes;
 - resolves fixed selections from literal values or safe primitive value nodes, then removes `ImpactSwitch`, `LatentSwitch`, and `SEGSSwitch` pass-through nodes by reconnecting consumers to the selected upstream input;
 - sends the complete submitted `extra_pnginfo.workflow` to metadata-aware nodes;

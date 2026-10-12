@@ -1457,7 +1457,7 @@ sys.exit(0 if result.get('success') else 1)
         if not self.task_completed:
             self.FailRender(f"ComfyUI error: {error_msg}")
 
-    def initialize_api_connection(self) -> bool:
+    def initialize_api_connection(self, workflow_data: dict) -> bool:
         """Initialize connection to ComfyUI API and get client ID"""
         try:
             time.sleep(2)  # Wait for server to be fully initialized
@@ -1470,15 +1470,31 @@ sys.exit(0 if result.get('success') else 1)
                 
             self.client_id = f"deadline-{uuid.uuid4().hex}"
             self.LogInfo(f"Got client ID: {self.client_id}")
-            object_info_response = self.http_request(f"{self.comfyui_api_url}/object_info")
-            if object_info_response['status_code'] != 200:
-                raise ComfyUIError(
-                    f"Worker {self.GetSlaveName()} did not return /object_info "
-                    f"(HTTP {object_info_response['status_code']})."
-                )
-            self.object_info = object_info_response['json']()
-            if not isinstance(self.object_info, dict) or not self.object_info:
-                raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid /object_info data.")
+            node_types = sorted({node["class_type"] for node in workflow_data.values()
+                                 if isinstance(node, dict) and isinstance(node.get("class_type"), str) and node["class_type"]})
+            self.object_info = {}
+            for class_type in node_types:
+                url = f"{self.comfyui_api_url}/object_info/{urllib.parse.quote(class_type, safe='')}"
+                try:
+                    object_info_response = self.http_request(url)
+                except OSError as e:
+                    raise ComfyUIError(
+                        f"Worker {self.GetSlaveName()} could not return metadata for node type "
+                        f"'{class_type}' from {url}: {e}"
+                    ) from e
+                if object_info_response['status_code'] != 200:
+                    raise ComfyUIError(
+                        f"Worker {self.GetSlaveName()} did not return metadata for node type "
+                        f"'{class_type}' (HTTP {object_info_response['status_code']})."
+                    )
+                definitions = object_info_response['json']()
+                if not isinstance(definitions, dict):
+                    raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid metadata for '{class_type}'.")
+                if class_type in definitions:
+                    if not isinstance(definitions[class_type], dict):
+                        raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid metadata for '{class_type}'.")
+                    self.object_info[class_type] = definitions[class_type]
+            self.LogInfo(f"Loaded metadata for {len(self.object_info)} workflow node types on worker {self.GetSlaveName()}")
             return True
         except Exception as e:
             self.LogWarning(f"Error initializing API connection: {e}")
@@ -2239,7 +2255,7 @@ sys.exit(0 if result.get('success') else 1)
 
             self._load_standard_workflow_metadata()
             
-            if not self.initialize_api_connection():
+            if not self.initialize_api_connection(workflow_data):
                 raise ComfyUIError("Could not initialize the ComfyUI API connection.")
             
             if not self.queue_workflow(workflow_data):
