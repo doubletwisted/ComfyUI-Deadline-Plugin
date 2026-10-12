@@ -54,9 +54,15 @@ Workers try those paths in order and use the first one that contains `ComfyUI\ma
 
 ## Reusing a worker's GUI session
 
-Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent or unverified, fallback resolves the configured NVIDIA UUID and launches an isolated instance. Unavailable ports are skipped in steps of 100 (for example 8188, 8288, 8388), with up to 100 attempts within the TCP port range. Deadline checks that it can bind the selected port and reserves it across worker processes before launch; its API requests use the selected port. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
 
 For a verified reused endpoint, task inputs are copied into an isolated `input/deadline/<submission-id>` subtree and recorded outputs are copied to the job output directory.
+
+## Multiple workers on one machine
+
+New ComfyUI processes hold an OS file lock for their selected port throughout the task, so simultaneous Deadline launches cannot select the same port while custom nodes load. Windows reservations live under `%PROGRAMDATA%\Thinkbox\Deadline10\comfyui_ports`; workers must be able to write there. Locks are released when the task ends or the plugin process exits. Each launch also receives a unique `--database-url` in Deadline's task temporary directory, avoiding the shared `ComfyUI/user/comfyui.db` lock. Workflow submission starts only after ComfyUI confirms that the selected listening port has bound.
+
+Set each worker's Deadline GPU affinity to its intended GPU. Port selection does not assign GPUs. After deploying an update, restart workers when idle to clear cached plugin copies.
 
 ## Use It
 

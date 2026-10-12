@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 
@@ -92,6 +93,7 @@ def new_plugin(**attrs):
     plugin.thread_running = True
     plugin.task_completed = False
     plugin.workflow_submitted = False
+    plugin.port_reservation = None
     plugin.comfyui_input_dir = ""
     plugin.comfyui_output_dir = ""
     plugin.custom_output_dir_specified = False
@@ -244,15 +246,67 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
         self.assertTrue(plugin._verified_comfy_endpoint("http://127.0.0.1:8188"))
         self.assertEqual(plugin.endpoint_session_id, "legacy-pid-42")
 
-    def test_unverified_occupied_endpoint_fails_closed(self):
+    def test_unverified_occupied_endpoint_uses_an_isolated_fallback_port(self):
         plugin = new_plugin(
             configured_comfyui_api_url="http://127.0.0.1:8188",
             endpoint_policy_active=True,
             http_request=lambda url, **kwargs: {"status_code": 503, "json": lambda: {}},
-            _is_port_in_use=lambda port: True,
+            _is_port_in_use=lambda port: port in (8188, 8288),
         )
+        self.assertEqual(plugin._configure_policy_endpoint(), "8388")
+        self.assertEqual(plugin.comfyui_api_url, "http://127.0.0.1:8388")
+        self.assertEqual(plugin.configured_comfyui_api_url, "http://127.0.0.1:8188")
+        self.assertFalse(plugin.use_existing_comfyui)
+
+    def test_free_port_is_preserved(self):
+        plugin = new_plugin(_is_port_in_use=lambda port: False)
+        self.assertEqual(plugin._find_available_port(8188), "8188")
+
+    def test_port_search_exhaustion_fails_instead_of_returning_occupied_port(self):
+        checked = []
+        plugin = new_plugin(_is_port_in_use=lambda port: checked.append(port) or True)
         with self.assertRaises(ComfyUIError):
-            plugin._configure_policy_endpoint()
+            plugin._find_available_port(8188)
+        self.assertEqual(len(checked), plugin_module.MAX_PORT_ATTEMPTS)
+        self.assertEqual(checked[:3], [8188, 8288, 8388])
+
+    def test_port_search_stays_within_tcp_port_range(self):
+        checked = []
+        plugin = new_plugin(_is_port_in_use=lambda port: checked.append(port) or True)
+        with self.assertRaises(ComfyUIError):
+            plugin._find_available_port(65500)
+        self.assertEqual(checked, [65500])
+
+    def test_bound_port_without_listener_is_unavailable(self):
+        with plugin_module.socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            plugin = new_plugin()
+            self.assertTrue(plugin._is_port_in_use(sock.getsockname()[1]))
+
+    def test_access_denied_port_is_unavailable(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.bind.side_effect = PermissionError("port reserved")
+        with patch.object(plugin_module.socket, "socket", return_value=sock):
+            self.assertTrue(new_plugin()._is_port_in_use(8188))
+
+    def test_render_arguments_recheck_port_and_update_api_url(self):
+        plugin = new_plugin(
+            comfyui_port="8188",
+            _resolve_comfyui_install_path=lambda: "C:/Comfy",
+            _is_port_in_use=lambda port: port == 8188,
+            _build_comfyui_arguments=lambda path: "--port " + plugin.comfyui_port,
+        )
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"PROGRAMDATA": temp}):
+            main = Path(temp) / "ComfyUI" / "main.py"
+            main.parent.mkdir()
+            main.touch()
+            plugin._resolve_comfyui_install_path = lambda: temp
+            try:
+                self.assertEqual(plugin.RenderArgument(), "--port 8288")
+            finally:
+                plugin._release_port_reservation()
+        self.assertEqual(plugin.comfyui_api_url, "http://127.0.0.1:8288")
 
     def test_fallback_launch_resolves_uuid_and_honors_deadline_affinity(self):
         plugin = new_plugin(

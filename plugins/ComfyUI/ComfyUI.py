@@ -20,6 +20,14 @@ import base64
 import shutil
 import copy
 import uuid
+import errno
+import tempfile
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 from typing import Tuple
 
 """
@@ -34,7 +42,7 @@ Supports both existing ComfyUI instances and launching new ones.
 # Constants
 DEFAULT_PORT = 8188
 PORT_OFFSET_PER_GPU = 100
-MAX_PORT_SEARCH_RANGE = 100
+MAX_PORT_ATTEMPTS = 100
 DEFAULT_POLLING_INTERVAL = 10  # seconds
 MAX_SEED_VALUE = 2147483647
 PROGRESS_LOG_INTERVAL = 10  # Log every 10 polls
@@ -151,10 +159,8 @@ class ComfyUI(DeadlinePlugin):
 
     def _setup_stdout_handlers(self):
         """Setup stdout handlers for ComfyUI output parsing"""
-        # Server startup handlers
-        self.AddStdoutHandlerCallback(".*Starting server.*").HandleCallback += self.HandleServerStarted
-        # Also catch the GUI message as backup
-        self.AddStdoutHandlerCallback(".*To see the GUI go to.*").HandleCallback += self.HandleServerStarted
+        # ComfyUI prints this only after the listening socket has bound.
+        self.AddStdoutHandlerCallback(r".*To see the GUI go to: http://\S+:(\d+).*").HandleCallback += self.HandleServerStarted
         self.AddStdoutHandlerCallback(".*Error:.*").HandleCallback += self.HandleStdoutError
         self.AddStdoutHandlerCallback(".*Exception:.*").HandleCallback += self.HandleStdoutError
 
@@ -196,6 +202,7 @@ class ComfyUI(DeadlinePlugin):
         self.object_info = None
         self.expected_outputs_by_prompt = {}
         self.submission_error = ""
+        self.port_reservation = None
         
         # Batch processing variables
         self.chunk_size = 1
@@ -279,6 +286,7 @@ class ComfyUI(DeadlinePlugin):
     def Cleanup(self):
         """Clean up plugin resources"""
         self.thread_running = False
+        self._release_port_reservation()
         
         # Clean up callbacks
         del self.InitializeProcessCallback
@@ -661,9 +669,9 @@ class ComfyUI(DeadlinePlugin):
             self.use_existing_comfyui, self.server_started = True, True
             self.LogInfo(f"Reusing verified ComfyUI endpoint {endpoint}; its running session determines GPU and this task queues only its own prompts.")
             return self.comfyui_port
-        if self._is_port_in_use(port):
-            raise ComfyUIError(f"Configured endpoint port {port} is occupied by an unverified service; refusing another port or replacement.")
-        self.LogInfo(f"Configured endpoint unavailable; fallback will start only at {endpoint}.")
+        self.comfyui_port = self._find_available_port(port)
+        self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+        self.LogInfo(f"Configured endpoint unavailable; starting isolated ComfyUI at {self.comfyui_api_url}.")
         return self.comfyui_port
 
     def _determine_final_port(self, base_port: int) -> str:
@@ -707,6 +715,11 @@ class ComfyUI(DeadlinePlugin):
         self.LogInfo("ComfyUI PreRenderTasks started.")
         
         try:
+            self._release_port_reservation()
+            self.server_started = False
+            self.workflow_submitted = False
+            self.thread_running = True
+            self.submission_error = ""
             self._setup_batch_processing()
             self._load_worker_endpoint_policy()
             comfyui_path = self._resolve_comfyui_install_path()
@@ -727,30 +740,72 @@ class ComfyUI(DeadlinePlugin):
         self.temp_dir = self.CreateTempDirectory("comfyui_job")
 
     def _is_port_in_use(self, port: int) -> bool:
-        """Check if the given port is already in use"""
+        """Check whether a new server can bind the port."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                result = s.connect_ex(('127.0.0.1', port))
-                return result == 0
-        except:
+                if os.name == "nt":
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                s.bind(('0.0.0.0', port))
             return False
+        except OSError:
+            return True
     
     def _find_available_port(self, start_port: int) -> str:
-        """Find an available port starting from start_port"""
+        """Try the requested port, then higher ports in steps of 100."""
         port = start_port
-        max_port = start_port + MAX_PORT_SEARCH_RANGE
-        
-        while port < max_port:
+        for _ in range(MAX_PORT_ATTEMPTS):
+            if not 1 <= port <= 65535:
+                break
             if not self._is_port_in_use(port):
+                if port != start_port:
+                    self.LogInfo(f"Port {start_port} unavailable; using port {port}.")
                 return str(port)
-            port += 1
-        
-        return str(start_port)
+            port += 100
+        raise ComfyUIError(f"No available ComfyUI port starting at {start_port} in steps of 100.")
+
+    def _reserve_launch_port(self, start_port: int) -> str:
+        """Keep other Deadline processes off this port while ComfyUI loads nodes."""
+        self._release_port_reservation()
+        lock_root = os.path.join(os.environ.get("PROGRAMDATA", tempfile.gettempdir()),
+                                 "Thinkbox", "Deadline10", "comfyui_ports")
+        os.makedirs(lock_root, exist_ok=True)
+        for attempt in range(MAX_PORT_ATTEMPTS):
+            port = start_port + attempt * PORT_OFFSET_PER_GPU
+            if not 1 <= port <= 65535:
+                break
+            if self._is_port_in_use(port):
+                continue
+            reservation = open(os.path.join(lock_root, f"{port}.lock"), "a+b")
+            try:
+                reservation.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(reservation.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(reservation.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                reservation.close()
+                if e.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise
+            self.port_reservation = reservation
+            # A non-Deadline application might have bound it during lock acquisition.
+            if self._is_port_in_use(port):
+                self._release_port_reservation()
+                continue
+            self.LogInfo(f"Reserved ComfyUI launch port {port} for worker {self.GetSlaveName()}")
+            return str(port)
+        raise ComfyUIError(f"No available ComfyUI launch port starting at {start_port} in steps of 100.")
+
+    def _release_port_reservation(self):
+        if self.port_reservation is not None:
+            self.port_reservation.close()
+            self.port_reservation = None
 
     def PostRenderTasks(self):
         """Cleanup tasks after rendering"""
         self.LogInfo("ComfyUI PostRenderTasks started.")
+        self.thread_running = False
+        self._release_port_reservation()
 
         if not self.task_completed:
             message = self.submission_error or (
@@ -835,6 +890,9 @@ class ComfyUI(DeadlinePlugin):
         # If using existing ComfyUI instance, return dummy command
         if self.use_existing_comfyui:
             return self._create_dummy_command()
+
+        self.comfyui_port = self._reserve_launch_port(int(self.comfyui_port))
+        self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
         
         # Build arguments for new ComfyUI instance
         return self._build_comfyui_arguments(comfyui_main_py)
@@ -884,6 +942,9 @@ sys.exit(0 if result.get('success') else 1)
         # Add main script and port
         args_list.append(f'"{comfyui_main_py}"')
         args_list.append(f"--port {port}")
+        database_path = os.path.abspath(os.path.join(self.temp_dir, f"comfyui-{uuid.uuid4().hex}.db"))
+        database_url = "sqlite:///" + database_path.replace("\\", "/")
+        args_list.append(f'--database-url "{database_url}"')
 
         # Add CUDA device argument
         cuda_arg = self._get_cuda_device_arg()
@@ -929,6 +990,8 @@ sys.exit(0 if result.get('success') else 1)
 
     def HandleServerStarted(self):
         """Called when the ComfyUI server has started"""
+        if self.GetRegexMatch(1) != self.comfyui_port or not self.thread_running:
+            return
         # Prevent multiple triggers from stdout handlers
         if self.workflow_submitted:
             self.LogInfo("ComfyUI server startup detected, but workflow already submitted - ignoring")
