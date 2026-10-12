@@ -54,9 +54,15 @@ Workers try those paths in order and use the first one that contains `ComfyUI\ma
 
 ## Reusing a worker's GUI session
 
-Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts on the configured port and resolves the configured NVIDIA UUID. An occupied, unverified endpoint fails the task. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
 
 For a verified reused endpoint, task inputs are copied into an isolated `input/deadline/<submission-id>` subtree and recorded outputs are copied to the job output directory.
+
+## Multiple workers on one machine
+
+Normal render jobs use a fixed port per CUDA device: `ComfyUIPort + 100 * GPU index`, with a default base of `8188`. GPU 0 uses `8188`, GPU 1 uses `8288`, and GPU 2 uses `8388`. Configure one active worker/task per GPU and enable each worker's Deadline GPU affinity for its assigned GPU. If a port is occupied, the task fails with an actionable error instead of switching ports. Port checks only bind a temporary socket; they create no lock folder and require no write access to `ProgramData`.
+
+Each new launch receives a unique `--database-url` in Deadline's task temporary directory, avoiding the shared `ComfyUI/user/comfyui.db` lock. Workflow submission starts only after ComfyUI confirms that the selected listening port has bound. After deploying an update, restart workers when idle to clear cached plugin copies.
 
 ## Use It
 
@@ -99,7 +105,7 @@ The worker writes the normal workflow metadata back into the output image when C
 
 Every variation is checked on the selected Deadline worker after input staging, seed expansion, and fixed-switch resolution. The worker:
 
-- validates every `class_type` against that worker's live `/object_info`;
+- validates every `class_type` using that worker's `/object_info/<class_type>` endpoint, requesting only node types present in the workflow;
 - rejects missing staged inputs and known browser-interactive nodes;
 - resolves fixed selections from literal values or safe primitive value nodes, then removes `ImpactSwitch`, `LatentSwitch`, and `SEGSSwitch` pass-through nodes by reconnecting consumers to the selected upstream input;
 - sends the complete submitted `extra_pnginfo.workflow` to metadata-aware nodes;
