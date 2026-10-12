@@ -4,8 +4,6 @@ import os
 from pathlib import Path
 import re
 import socket
-import subprocess
-import sys
 import tempfile
 import types
 import unittest
@@ -15,74 +13,54 @@ from test_reuse_endpoint import ComfyUIError, new_plugin, plugin_module
 
 
 class WorkerStartupTests(unittest.TestCase):
-    def test_simultaneous_processes_reserve_different_ports_before_servers_start(self):
+    def test_worker_gpu_affinity_drives_both_fixed_port_and_launch_device(self):
+        ports = []
+        with tempfile.TemporaryDirectory() as temp:
+            for gpu in (0, 1, 4, 7):
+                with self.subTest(gpu=gpu):
+                    plugin = new_plugin(
+                        OverrideGpuAffinity=lambda: True,
+                        GpuAffinity=lambda: [gpu],
+                        GetThreadNumber=lambda: 0,
+                        _is_port_in_use=lambda port: False,
+                        temp_dir=temp,
+                    )
+                    port = plugin._calculate_comfyui_port()
+                    self.assertEqual(port, str(8188 + gpu * 100))
+                    self.assertEqual(plugin.comfyui_api_url, "http://127.0.0.1:" + port)
+                    arguments = plugin._build_comfyui_arguments("C:/Comfy/ComfyUI/main.py")
+                    self.assertIn(f"--port {port}", arguments)
+                    self.assertIn(f"--cuda-device {gpu}", arguments)
+                    ports.append(port)
+        self.assertEqual(len(set(ports)), 4)
+
+    def test_occupied_gpu_port_fails_without_switching_ports(self):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
-            start_port = sock.getsockname()[1]
-        script = """
-import sys
-sys.path.insert(0, sys.argv[1])
-from test_reuse_endpoint import new_plugin
-plugin = new_plugin()
-sys.stdin.readline()
-print(plugin._reserve_launch_port(int(sys.argv[2])), flush=True)
-sys.stdin.readline()
-"""
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"PROGRAMDATA": temp}):
-            processes = []
-            try:
-                for _ in range(2):
-                    processes.append(subprocess.Popen(
-                        [sys.executable, "-c", script, str(Path(__file__).parent), str(start_port)],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, env=os.environ.copy(),
-                    ))
-                for process in processes:
-                    process.stdin.write("start\n")
-                    process.stdin.flush()
-                ports = [int(process.stdout.readline()) for process in processes]
-                self.assertEqual(len(set(ports)), 2)
-                # The reservations do not prevent ComfyUI's TCP listeners binding.
-                for port in ports:
-                    with socket.socket() as sock:
-                        sock.bind(("127.0.0.1", port))
-                # Killing a holder releases its OS lock without deleting the lock file.
-                for process in processes:
-                    process.terminate()
-                    process.wait(timeout=10)
-                plugin = new_plugin()
-                try:
-                    self.assertEqual(plugin._reserve_launch_port(min(ports)), str(min(ports)))
-                finally:
-                    plugin._release_port_reservation()
-            finally:
-                for process in processes:
-                    if process.poll() is None:
-                        process.kill()
-                    process.communicate(timeout=10)
+            port = sock.getsockname()[1]
+            plugin = new_plugin(
+                OverrideGpuAffinity=lambda: True,
+                GpuAffinity=lambda: [0],
+                GetThreadNumber=lambda: 0,
+                GetPluginInfoEntryWithDefault=lambda key, default: str(port) if key == "ComfyUIPort" else default,
+            )
+            with self.assertRaisesRegex(ComfyUIError, f"{port} is already in use"):
+                plugin._calculate_comfyui_port()
+            self.assertEqual(plugin.comfyui_port, str(port))
 
-    def test_port_taken_during_reservation_is_skipped_and_released(self):
-        plugin = new_plugin(_is_port_in_use=MagicMock(side_effect=[False, True, False, False]))
-        probe = new_plugin(_is_port_in_use=lambda port: False)
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"PROGRAMDATA": temp}):
-            try:
-                self.assertEqual(plugin._reserve_launch_port(8188), "8288")
-                self.assertEqual(probe._reserve_launch_port(8188), "8188")
-            finally:
-                plugin._release_port_reservation()
-                probe._release_port_reservation()
+    def test_fixed_ports_need_no_lock_folder(self):
+        plugin = new_plugin(_get_cuda_device_arg=lambda: "--cuda-device 1", _is_port_in_use=lambda port: False)
+        with patch.object(plugin_module.os, "makedirs", side_effect=PermissionError("access denied")) as mkdir, \
+                patch("builtins.open", side_effect=PermissionError("access denied")) as open_file:
+            self.assertEqual(plugin._calculate_comfyui_port(), "8288")
+            mkdir.assert_not_called()
+            open_file.assert_not_called()
 
-    def test_launch_port_exhaustion_and_range_limit_fail(self):
-        plugin = new_plugin(_is_port_in_use=MagicMock(return_value=True))
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"PROGRAMDATA": temp}):
-            with self.assertRaises(ComfyUIError):
-                plugin._reserve_launch_port(8188)
-            self.assertEqual(plugin._is_port_in_use.call_count, plugin_module.MAX_PORT_ATTEMPTS)
-            plugin._is_port_in_use.reset_mock()
-            with self.assertRaises(ComfyUIError):
-                plugin._reserve_launch_port(65500)
-            plugin._is_port_in_use.assert_called_once_with(65500)
-        self.assertIsNone(plugin.port_reservation)
+    def test_invalid_fixed_port_fails_before_launch(self):
+        for port in (0, 65536):
+            with self.subTest(port=port):
+                with self.assertRaisesRegex(ComfyUIError, "outside the TCP port range"):
+                    new_plugin()._check_launch_port(port)
 
     def test_new_instances_get_separate_task_databases(self):
         with tempfile.TemporaryDirectory(prefix="deadline job ") as temp:
@@ -133,17 +111,17 @@ sys.stdin.readline()
         self.assertFalse(plugin.server_started)
         self.assertFalse(plugin.workflow_submitted)
 
-    def test_reused_instance_launch_does_not_reserve_a_port_or_build_arguments(self):
+    def test_reused_instance_launch_does_not_check_its_occupied_port_or_build_arguments(self):
         plugin = new_plugin(
             use_existing_comfyui=True,
             _resolve_comfyui_install_path=lambda: "C:/Comfy",
             _create_dummy_command=lambda: "reuse waiter",
-            _reserve_launch_port=MagicMock(),
+            _check_launch_port=MagicMock(),
             _build_comfyui_arguments=MagicMock(),
         )
         with patch.object(plugin_module.os.path, "exists", return_value=True):
             self.assertEqual(plugin.RenderArgument(), "reuse waiter")
-        plugin._reserve_launch_port.assert_not_called()
+        plugin._check_launch_port.assert_not_called()
         plugin._build_comfyui_arguments.assert_not_called()
 
 

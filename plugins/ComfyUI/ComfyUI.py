@@ -20,13 +20,6 @@ import base64
 import shutil
 import copy
 import uuid
-import errno
-import tempfile
-
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
 
 from typing import Tuple
 
@@ -42,7 +35,6 @@ Supports both existing ComfyUI instances and launching new ones.
 # Constants
 DEFAULT_PORT = 8188
 PORT_OFFSET_PER_GPU = 100
-MAX_PORT_ATTEMPTS = 100
 DEFAULT_POLLING_INTERVAL = 10  # seconds
 MAX_SEED_VALUE = 2147483647
 PROGRESS_LOG_INTERVAL = 10  # Log every 10 polls
@@ -202,7 +194,6 @@ class ComfyUI(DeadlinePlugin):
         self.object_info = None
         self.expected_outputs_by_prompt = {}
         self.submission_error = ""
-        self.port_reservation = None
         
         # Batch processing variables
         self.chunk_size = 1
@@ -286,7 +277,6 @@ class ComfyUI(DeadlinePlugin):
     def Cleanup(self):
         """Clean up plugin resources"""
         self.thread_running = False
-        self._release_port_reservation()
         
         # Clean up callbacks
         del self.InitializeProcessCallback
@@ -669,8 +659,7 @@ class ComfyUI(DeadlinePlugin):
             self.use_existing_comfyui, self.server_started = True, True
             self.LogInfo(f"Reusing verified ComfyUI endpoint {endpoint}; its running session determines GPU and this task queues only its own prompts.")
             return self.comfyui_port
-        self.comfyui_port = self._find_available_port(port)
-        self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+        self._check_launch_port(port)
         self.LogInfo(f"Configured endpoint unavailable; starting isolated ComfyUI at {self.comfyui_api_url}.")
         return self.comfyui_port
 
@@ -681,13 +670,14 @@ class ComfyUI(DeadlinePlugin):
         self.use_existing_comfyui = False
         if worker_mode or distributed_mode:
             worker_port = self._calculate_worker_port(base_port)
-            self.comfyui_port = self._find_available_port(worker_port)
+            self.comfyui_port = str(worker_port)
             self.LogInfo(f"Worker/distributed mode: starting isolated ComfyUI on port {self.comfyui_port}")
         else:
-            self.comfyui_port = self._find_available_port(base_port)
+            self.comfyui_port = str(base_port)
             self.LogInfo(f"Normal render mode: starting isolated ComfyUI on port {self.comfyui_port}")
 
         self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+        self._check_launch_port(int(self.comfyui_port))
         
         return self.comfyui_port
 
@@ -715,7 +705,6 @@ class ComfyUI(DeadlinePlugin):
         self.LogInfo("ComfyUI PreRenderTasks started.")
         
         try:
-            self._release_port_reservation()
             self.server_started = False
             self.workflow_submitted = False
             self.thread_running = True
@@ -750,62 +739,20 @@ class ComfyUI(DeadlinePlugin):
         except OSError:
             return True
     
-    def _find_available_port(self, start_port: int) -> str:
-        """Try the requested port, then higher ports in steps of 100."""
-        port = start_port
-        for _ in range(MAX_PORT_ATTEMPTS):
-            if not 1 <= port <= 65535:
-                break
-            if not self._is_port_in_use(port):
-                if port != start_port:
-                    self.LogInfo(f"Port {start_port} unavailable; using port {port}.")
-                return str(port)
-            port += 100
-        raise ComfyUIError(f"No available ComfyUI port starting at {start_port} in steps of 100.")
-
-    def _reserve_launch_port(self, start_port: int) -> str:
-        """Keep other Deadline processes off this port while ComfyUI loads nodes."""
-        self._release_port_reservation()
-        lock_root = os.path.join(os.environ.get("PROGRAMDATA", tempfile.gettempdir()),
-                                 "Thinkbox", "Deadline10", "comfyui_ports")
-        os.makedirs(lock_root, exist_ok=True)
-        for attempt in range(MAX_PORT_ATTEMPTS):
-            port = start_port + attempt * PORT_OFFSET_PER_GPU
-            if not 1 <= port <= 65535:
-                break
-            if self._is_port_in_use(port):
-                continue
-            reservation = open(os.path.join(lock_root, f"{port}.lock"), "a+b")
-            try:
-                reservation.seek(0)
-                if os.name == "nt":
-                    msvcrt.locking(reservation.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    fcntl.flock(reservation.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as e:
-                reservation.close()
-                if e.errno in (errno.EACCES, errno.EAGAIN):
-                    continue
-                raise
-            self.port_reservation = reservation
-            # A non-Deadline application might have bound it during lock acquisition.
-            if self._is_port_in_use(port):
-                self._release_port_reservation()
-                continue
-            self.LogInfo(f"Reserved ComfyUI launch port {port} for worker {self.GetSlaveName()}")
-            return str(port)
-        raise ComfyUIError(f"No available ComfyUI launch port starting at {start_port} in steps of 100.")
-
-    def _release_port_reservation(self):
-        if self.port_reservation is not None:
-            self.port_reservation.close()
-            self.port_reservation = None
+    def _check_launch_port(self, port: int):
+        if not 1 <= port <= 65535:
+            raise ComfyUIError(f"ComfyUI port {port} is outside the TCP port range.")
+        if self._is_port_in_use(port):
+            raise ComfyUIError(
+                f"ComfyUI port {port} is already in use on worker {self.GetSlaveName()}. "
+                "Stop the previous instance or set a different ComfyUIPort base. "
+                "Each GPU must have only one active Deadline worker/task."
+            )
 
     def PostRenderTasks(self):
         """Cleanup tasks after rendering"""
         self.LogInfo("ComfyUI PostRenderTasks started.")
         self.thread_running = False
-        self._release_port_reservation()
 
         if not self.task_completed:
             message = self.submission_error or (
@@ -891,8 +838,7 @@ class ComfyUI(DeadlinePlugin):
         if self.use_existing_comfyui:
             return self._create_dummy_command()
 
-        self.comfyui_port = self._reserve_launch_port(int(self.comfyui_port))
-        self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+        self._check_launch_port(int(self.comfyui_port))
         
         # Build arguments for new ComfyUI instance
         return self._build_comfyui_arguments(comfyui_main_py)
