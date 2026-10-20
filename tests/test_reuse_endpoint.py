@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 
@@ -44,6 +45,7 @@ def _install_import_stubs():
     plugins.DeadlinePlugin = DeadlinePlugin
     plugins.PluginType = PluginType
     scripting.RepositoryUtils = RepositoryUtils
+    scripting.PathUtils = types.SimpleNamespace(GetMappedDriveNetworkPath=lambda drive: "")
     scripting.SystemUtils = object()
     scripting.FileUtils = object()
     diagnostics.ProcessPriorityClass = types.SimpleNamespace(BelowNormal="BelowNormal")
@@ -251,8 +253,36 @@ class ReuseEndpointCurrentTests(unittest.TestCase):
             http_request=lambda url, **kwargs: {"status_code": 503, "json": lambda: {}},
             _is_port_in_use=lambda port: True,
         )
-        with self.assertRaises(ComfyUIError):
+        with self.assertRaisesRegex(ComfyUIError, "8188 is already in use"):
             plugin._configure_policy_endpoint()
+        self.assertEqual(plugin.comfyui_api_url, "http://127.0.0.1:8188")
+        self.assertFalse(plugin.use_existing_comfyui)
+
+    def test_bound_port_without_listener_is_unavailable(self):
+        with plugin_module.socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            plugin = new_plugin()
+            self.assertTrue(plugin._is_port_in_use(sock.getsockname()[1]))
+
+    def test_access_denied_port_is_unavailable(self):
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.bind.side_effect = PermissionError("port reserved")
+        with patch.object(plugin_module.socket, "socket", return_value=sock):
+            self.assertTrue(new_plugin()._is_port_in_use(8188))
+
+    def test_render_arguments_recheck_fixed_port_before_launch(self):
+        plugin = new_plugin(
+            comfyui_port="8188",
+            _resolve_comfyui_install_path=lambda: "C:/Comfy",
+            _is_port_in_use=lambda port: True,
+            _build_comfyui_arguments=MagicMock(),
+        )
+        with patch.object(plugin_module.os.path, "exists", return_value=True):
+            with self.assertRaisesRegex(ComfyUIError, "8188 is already in use"):
+                plugin.RenderArgument()
+        self.assertEqual(plugin.comfyui_port, "8188")
+        plugin._build_comfyui_arguments.assert_not_called()
 
     def test_fallback_launch_resolves_uuid_and_honors_deadline_affinity(self):
         plugin = new_plugin(

@@ -54,13 +54,40 @@ Workers try those paths in order and use the first one that contains `ComfyUI\ma
 
 ## Reusing a worker's GUI session
 
-Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts only on the configured port and resolves the configured NVIDIA UUID. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts on the configured port and resolves the configured NVIDIA UUID. An occupied, unverified endpoint fails the task. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
 
 For a verified reused endpoint, task inputs are copied into an isolated `input/deadline/<submission-id>` subtree and recorded outputs are copied to the job output directory.
 
+## Multiple workers on one machine
+
+Normal render jobs use a fixed port per CUDA device: `ComfyUIPort + 100 * GPU index`, with a default base of `8188`. GPU 0 uses `8188`, GPU 1 uses `8288`, and GPU 2 uses `8388`. Configure one active worker/task per GPU and enable each worker's Deadline GPU affinity for its assigned GPU. If a port is occupied, the task fails with an actionable error instead of switching ports. Port checks only bind a temporary socket; they create no lock folder and require no write access to `ProgramData`.
+
+Each new launch receives a unique `--database-url` in Deadline's task temporary directory, avoiding the shared `ComfyUI/user/comfyui.db` lock. Workflow submission starts only after ComfyUI confirms that the selected listening port has bound. After deploying an update, restart workers when idle to clear cached plugin copies.
+
 ## Use It
 
-Add `Submit to Deadline` to your workflow, set `output_directory` to a path the farm can see, and run the workflow in ComfyUI.
+Add `Submit to Deadline` to your workflow, enter a full `output_directory` path such as `X:\outputs\shot010`, and run it. The path is checked against the admin's allowed storage locations before staging files or submitting the job. Normal uploaded inputs need no extra setup.
+
+### Farm storage (admin, once per farm)
+
+In Deadline Monitor, open **Tools > Configure Plugins > ComfyUI**:
+
+Set **Allowed Storage Locations** to the drives or folders users may read from and write to. Enter one location per line:
+
+```text
+X:\*
+Y:\*
+G:\*
+\\server\share\projects\*
+```
+
+`X:\*` allows the whole X drive; `X:\projects\*` limits access to that folder and all its subfolders. Plain absolute folder paths also work. Only a final `\*` is supported; patterns such as `X:\project*\renders` are rejected.
+
+The studio defaults allow all of G: and Y:, plus only `X:\input`, `X:\outputs`, and `X:\playground`. Equivalent UNC rules are included: `\\NAS02\grajdolek`, `\\NAS04\3d-02`, and the three matching folders beneath `\\NAS02\Comfy`. Other folders on X: remain blocked.
+
+Both mapped and UNC paths can be entered. On submission, mapped network paths are converted to their current UNC locations, validated, and stored in the job as UNC paths. UNC inputs work directly, so workers do not need matching drive letters for this plugin's staged inputs and outputs. Existing local drive paths remain local. If another node keeps an unstaged drive-letter path, that node still needs the drive mapped on its workers. Deadline services can have different drive mappings from interactive users; see [Deadline's mapped-drive documentation](https://docs.thinkboxsoftware.com/products/deadline/10.4/1_User%20Manual/manual/repository-config.html#mapped-drives).
+
+Submitters and workers read this policy automatically from Deadline. No environment variables, JSON, or per-artist configuration is needed. Users keep entering full paths; paths outside allowed storage are rejected. The existing **Default Output Directory** setting and local ComfyUI input/output folders are already allowed. Configure storage before deploying 1.1, including for jobs already queued.
 
 Use `batch_count` for how many variations you want. Use `chunk_size` for how many variations a Deadline task should process before it finishes. These are variations, not animation frames.
 
@@ -74,17 +101,25 @@ variation 2 -> 1002
 
 ## Input Files
 
-Normal ComfyUI loader nodes copy pasted or uploaded files into `ComfyUI/input`. That folder usually exists only on the machine where you submitted the job, so the plugin stages those referenced files next to your output folder:
+Normal ComfyUI loader nodes copy pasted or uploaded files into `ComfyUI/input`. That folder usually exists only on the machine where you submitted the job, so the plugin stages those referenced files inside your approved output folder:
 
 ```text
-<output parent>\input\
+<output directory>\.deadline-inputs\<submission id>\
 ```
 
-Workers start ComfyUI with that folder as `--input-directory`.
+Workers start ComfyUI with that submission's folder as `--input-directory`, so loader metadata scans only its inputs instead of the shared input archive. Existing jobs keep their original input directory.
 
-Only files used by the submitted prompt are copied. This includes the built-in file loaders and VideoHelperSuite's `VHS_LoadVideo`, `VHS_LoadVideoFFmpeg`, and `VHS_LoadAudioUpload` nodes. VideoHelperSuite path nodes (`VHS_LoadVideoPath`, `VHS_LoadVideoFFmpegPath`, `VHS_LoadImagePath`, and `VHS_LoadAudio`) are also supported when they point to an existing media file; the submitted prompt is rewritten to the staged farm-visible file. If a file already exists and is identical, it is reused. If the name collides with a different file, the plugin gives the staged copy a unique suffix.
+Only files used by the submitted prompt are copied. This includes the built-in file loaders and VideoHelperSuite's `VHS_LoadVideo`, `VHS_LoadVideoFFmpeg`, and `VHS_LoadAudioUpload` nodes. VideoHelperSuite path nodes (`VHS_LoadVideoPath`, `VHS_LoadVideoFFmpegPath`, `VHS_LoadImagePath`, and `VHS_LoadAudio`) are also supported when they point to an existing media file inside an approved input root; the submitted prompt is rewritten to the staged farm-visible file. If a file already exists and is identical, it is reused. If the name collides with a different file, the plugin gives the staged copy a unique suffix.
 
 Directory loaders, including `VHS_LoadImagesPath`, are not copied. Absolute paths for unsupported nodes are left alone and must already be valid on the farm.
+
+## Security boundaries
+
+Job metadata cannot contain extra Deadline job-file lines. Storage paths reject traversal, Windows device paths and alternate data streams, and symlinks or junctions that escape approved roots. API calls use loopback HTTP with proxies and redirects disabled. Reused sessions run a plain `reuse_waiter.py` script; no encoded `exec` launcher is used.
+
+The plugin submits ComfyUI workflows; it does not sandbox other custom nodes or Deadline job authors. Install trusted nodes and keep Deadline, ComfyUI, and approved storage writable only by trusted users. Runtime subprocess calls are required to invoke the installed Deadline client and worker utilities; they use argument lists without a shell.
+
+Registry security status is assigned by Comfy Registry. Each published version requires its own scan/review; updating the plugin does not change the status of immutable older releases. See the [Registry security standards](https://docs.comfy.org/registry/standards).
 
 ## Workflow Metadata
 
@@ -99,7 +134,7 @@ The worker writes the normal workflow metadata back into the output image when C
 
 Every variation is checked on the selected Deadline worker after input staging, seed expansion, and fixed-switch resolution. The worker:
 
-- validates every `class_type` against that worker's live `/object_info`;
+- validates every `class_type` using that worker's `/object_info/<class_type>` endpoint, requesting only node types present in the workflow;
 - rejects missing staged inputs and known browser-interactive nodes;
 - resolves fixed selections from literal values or safe primitive value nodes, then removes `ImpactSwitch`, `LatentSwitch`, and `SEGSSwitch` pass-through nodes by reconnecting consumers to the selected upstream input;
 - sends the complete submitted `extra_pnginfo.workflow` to metadata-aware nodes;

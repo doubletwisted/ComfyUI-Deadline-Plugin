@@ -23,6 +23,8 @@ so all stdout/stderr (or Deadline logging if available) ends up in job logs.
 """
 
 import os
+import ntpath
+import re
 import shutil
 import subprocess
 import sys
@@ -97,12 +99,8 @@ def calculate_required_space(valid_model_paths, dest_dir):
 
     for source_path in valid_model_paths:
         # Calculate destination path
-        if source_path.startswith(SOURCE_DIR):
-            relative_path = source_path[len(SOURCE_DIR):].lstrip(os.sep)
-        else:
-            relative_path = os.path.basename(source_path)
-
-        dest_path = os.path.join(dest_dir, relative_path)
+        relative_path = os.path.relpath(checked_model_path(SOURCE_DIR, source_path), SOURCE_DIR)
+        dest_path = checked_model_path(dest_dir, os.path.join(dest_dir, relative_path))
 
         # Check if file needs copying
         needs_copy_flag, _ = needs_copy(source_path, dest_path)
@@ -151,6 +149,27 @@ def get_computer_config():
     return dest_dir
 
 
+def checked_model_path(root, path):
+    if not os.path.isabs(path) or any(c in path for c in '\x00\r\n"'):
+        raise ValueError("Model paths must be absolute and contain no control characters or quotes")
+    _, tail = ntpath.splitdrive(path)
+    if ":" in tail or ".." in tail.replace("\\", "/").split("/") or path.replace("\\", "/").startswith(("//?/", "//./")):
+        raise ValueError("Unsafe model path")
+    for part in tail.replace("\\", "/").split("/"):
+        if part and (part.rstrip(" .") != part or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part)):
+            raise ValueError("Unsafe model path component")
+    root = os.path.normpath(os.path.abspath(root) + os.sep)
+    path = os.path.normpath(os.path.abspath(path) + os.sep)
+    # Reject foreign shares before resolving links or checking file existence.
+    if os.path.commonpath([os.path.normcase(root), os.path.normcase(path)]) != os.path.normcase(root):
+        raise ValueError("Model path is outside its configured root")
+    real_root = os.path.normcase(os.path.normpath(os.path.realpath(root) + os.sep))
+    real_path = os.path.normcase(os.path.normpath(os.path.realpath(path) + os.sep))
+    if real_path == real_root or os.path.commonpath([real_root, real_path]) != real_root:
+        raise ValueError("Model path escapes its configured root")
+    return path
+
+
 def read_model_list():
     """Read and parse the model list file."""
     if not os.path.exists(MODEL_LIST_PATH):
@@ -164,7 +183,7 @@ def read_model_list():
     for line in lines:
         line = line.strip()
         if line and not line.startswith('#'):
-            model_paths.append(line)
+            model_paths.append(checked_model_path(SOURCE_DIR, line))
 
     log("Loaded {0} model paths from list".format(len(model_paths)))
     return model_paths
@@ -192,6 +211,7 @@ def analyze_models(model_paths):
     missing_files = []
 
     for model_path in model_paths:
+        model_path = checked_model_path(SOURCE_DIR, model_path)
         if os.path.exists(model_path):
             valid_files.append(model_path)
         else:
@@ -218,9 +238,8 @@ def cleanup_extra_files(valid_model_paths):
     # Build set of expected relative paths
     expected_relative_paths = set()
     for model_path in valid_model_paths:
-        if model_path.startswith(SOURCE_DIR):
-            relative_path = model_path[len(SOURCE_DIR):].lstrip(os.sep)
-            expected_relative_paths.add(relative_path)
+        relative_path = os.path.relpath(checked_model_path(SOURCE_DIR, model_path), SOURCE_DIR)
+        expected_relative_paths.add(relative_path)
 
     # Find all files in destination
     removed_count = 0
@@ -228,7 +247,7 @@ def cleanup_extra_files(valid_model_paths):
 
     for root, dirs, files in os.walk(DEST_DIR):
         for file in files:
-            full_path = os.path.join(root, file)
+            full_path = checked_model_path(DEST_DIR, os.path.join(root, file))
             relative_path = os.path.relpath(full_path, DEST_DIR)
 
             if relative_path not in expected_relative_paths:
@@ -244,7 +263,7 @@ def cleanup_extra_files(valid_model_paths):
     # Clean up empty directories
     for root, dirs, files in os.walk(DEST_DIR, topdown=False):
         for dir_name in dirs:
-            dir_path = os.path.join(root, dir_name)
+            dir_path = checked_model_path(DEST_DIR, os.path.join(root, dir_name))
             try:
                 if not os.listdir(dir_path):
                     os.rmdir(dir_path)
@@ -281,6 +300,8 @@ def needs_copy(source_path, dest_path):
 
 def copy_model_file(source_path, dest_path):
     """Copy a model file using robocopy."""
+    source_path = checked_model_path(SOURCE_DIR, source_path)
+    dest_path = checked_model_path(DEST_DIR, dest_path)
     source_dir = os.path.dirname(source_path)
     dest_dir = os.path.dirname(dest_path)
     file_name = os.path.basename(source_path)
@@ -316,12 +337,8 @@ def sync_models(valid_model_paths):
         total_processed += 1
 
         # Calculate destination path
-        if source_path.startswith(SOURCE_DIR):
-            relative_path = source_path[len(SOURCE_DIR):].lstrip(os.sep)
-        else:
-            relative_path = os.path.basename(source_path)
-
-        dest_path = os.path.join(DEST_DIR, relative_path)
+        relative_path = os.path.relpath(checked_model_path(SOURCE_DIR, source_path), SOURCE_DIR)
+        dest_path = checked_model_path(DEST_DIR, os.path.join(DEST_DIR, relative_path))
 
         # Check if copy is needed
         needs_copy_flag, reason = needs_copy(source_path, dest_path)

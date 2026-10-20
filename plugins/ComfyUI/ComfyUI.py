@@ -6,6 +6,7 @@ import os
 import re 
 import sys
 import json
+import ntpath
 import time
 import socket
 import threading
@@ -16,10 +17,14 @@ import traceback
 import random
 import platform
 import subprocess
-import base64
 import shutil
 import copy
 import uuid
+import importlib.util
+
+_spool_spec = importlib.util.spec_from_file_location("spool_deadline_protocol", os.path.join(os.path.dirname(__file__), "spool_protocol.py"))
+spool_protocol = importlib.util.module_from_spec(_spool_spec)
+_spool_spec.loader.exec_module(spool_protocol)
 from typing import Tuple
 
 """
@@ -34,7 +39,6 @@ Supports both existing ComfyUI instances and launching new ones.
 # Constants
 DEFAULT_PORT = 8188
 PORT_OFFSET_PER_GPU = 100
-MAX_PORT_SEARCH_RANGE = 100
 DEFAULT_POLLING_INTERVAL = 10  # seconds
 MAX_SEED_VALUE = 2147483647
 PROGRESS_LOG_INTERVAL = 10  # Log every 10 polls
@@ -55,6 +59,12 @@ STAGED_FILE_INPUTS = {
     "VHS_LoadVideo": {"video"},
     "VHS_LoadVideoFFmpeg": {"video"},
     "VHS_LoadAudioUpload": {"audio"},
+}
+ABSOLUTE_FILE_INPUTS = {
+    "VHS_LoadVideoPath": {"video"},
+    "VHS_LoadVideoFFmpegPath": {"video"},
+    "VHS_LoadImagePath": {"image"},
+    "VHS_LoadAudio": {"audio_file"},
 }
 
 # Nodes in this set wait for a browser/client decision or consume state that is
@@ -100,6 +110,41 @@ FIXED_VALUE_NODE_TYPES = {
 }
 
 FILE_OUTPUT_GROUPS = ("images", "gifs", "videos", "audio")
+
+
+def approved_path(path, roots):
+    if not isinstance(path, str) or not path or any(c in path for c in '\x00\r\n"'):
+        raise ComfyUIError("Path must be nonempty and contain no quotes or control characters.")
+    if path.replace("\\", "/").startswith(("//?/", "//./")):
+        raise ComfyUIError("Windows device paths are not allowed.")
+    _, tail = ntpath.splitdrive(path)
+    for part in tail.replace("\\", "/").split("/"):
+        if not part or part == ".":
+            continue
+        if part == ".." or part.rstrip(" .") != part or ":" in part or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part):
+            raise ComfyUIError("Unsafe storage path.")
+    if not os.path.isabs(path):
+        raise ComfyUIError("Storage paths must be absolute.")
+    # Preserve the rooted UNC share anchor, including when realpath drops its slash.
+    candidate = os.path.normpath(os.path.abspath(path) + os.sep)
+    for root in roots:
+        root = os.path.normpath(os.path.abspath(root) + os.sep)
+        try:
+            if os.path.commonpath([os.path.normcase(root), os.path.normcase(candidate)]) != os.path.normcase(root):
+                continue
+            real_root = os.path.normcase(os.path.normpath(os.path.realpath(root) + os.sep))
+            real_candidate = os.path.normcase(os.path.normpath(os.path.realpath(candidate) + os.sep))
+            if os.path.commonpath([real_root, real_candidate]) == real_root:
+                return candidate
+        except ValueError:
+            continue
+    raise ComfyUIError("Path is outside the approved storage roots.")
+
+
+class LocalAPIHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ComfyUIError("ComfyUI API redirects are not allowed.")
+
 
 def get_distributed_config_for_plugin(plugin) -> Tuple[bool, bool, bool]:
     """Get distributed configuration with plugin info priority, fallback to environment"""
@@ -151,10 +196,8 @@ class ComfyUI(DeadlinePlugin):
 
     def _setup_stdout_handlers(self):
         """Setup stdout handlers for ComfyUI output parsing"""
-        # Server startup handlers
-        self.AddStdoutHandlerCallback(".*Starting server.*").HandleCallback += self.HandleServerStarted
-        # Also catch the GUI message as backup
-        self.AddStdoutHandlerCallback(".*To see the GUI go to.*").HandleCallback += self.HandleServerStarted
+        # ComfyUI prints this only after the listening socket has bound.
+        self.AddStdoutHandlerCallback(r".*To see the GUI go to: http://\S+:(\d+).*").HandleCallback += self.HandleServerStarted
         self.AddStdoutHandlerCallback(".*Error:.*").HandleCallback += self.HandleStdoutError
         self.AddStdoutHandlerCallback(".*Exception:.*").HandleCallback += self.HandleStdoutError
 
@@ -400,6 +443,14 @@ class ComfyUI(DeadlinePlugin):
 
     def _get_assigned_variation_indices(self):
         """Return Deadline frame numbers for the current task; frames are variation indices."""
+        if self.GetPluginInfoEntryWithDefault("SpoolRequestFile", ""):
+            try:
+                indices = list(range(int(self.GetStartFrame()), int(self.GetEndFrame()) + 1))
+            except Exception as error:
+                raise ComfyUIError("Spool requires explicit Deadline frame assignment: " + str(error))
+            if indices != [0] or self.batch_count != 1:
+                raise ComfyUIError("Spool job must assign exactly variation zero")
+            return indices
         chunk_size = max(1, int(self.GetJob().ChunkSize))
         task_id = int(self.GetCurrentTaskId())
         start_from_task = task_id * chunk_size
@@ -434,7 +485,7 @@ class ComfyUI(DeadlinePlugin):
 
     def _setup_custom_output_directory(self, output_dir: str):
         """Setup custom output directory"""
-        self.comfyui_output_dir = os.path.abspath(output_dir)
+        self.comfyui_output_dir = approved_path(RepositoryUtils.CheckPathMapping(output_dir), self._storage_roots("output"))
         self.custom_output_dir_specified = True
         self.LogInfo(f"ComfyUI will output directly to user-specified directory: {self.comfyui_output_dir}")
         
@@ -467,6 +518,8 @@ class ComfyUI(DeadlinePlugin):
         input_dir = self.GetPluginInfoEntryWithDefault("JobInputDirectory", "").strip()
         self.input_manifest_file = self.GetPluginInfoEntryWithDefault("InputManifestFile", "").strip()
         self.submission_id = self.GetPluginInfoEntryWithDefault("SubmissionId", "").strip()
+        if self.submission_id and not re.fullmatch(r"[A-Za-z0-9_-]+", self.submission_id):
+            raise ComfyUIError("Invalid SubmissionId.")
 
         if not input_dir:
             self.comfyui_input_dir = ""
@@ -478,11 +531,30 @@ class ComfyUI(DeadlinePlugin):
         except Exception as e:
             self.LogWarning(f"Path mapping failed for JobInputDirectory '{input_dir}': {e}")
 
-        self.comfyui_input_dir = os.path.abspath(os.path.expandvars(input_dir))
+        self.comfyui_input_dir = approved_path(input_dir, self._storage_roots("input") + self._storage_roots("output"))
         if not os.path.isdir(self.comfyui_input_dir):
             raise ComfyUIError(f"Staged input directory does not exist: {self.comfyui_input_dir}")
 
         self.LogInfo(f"ComfyUI will use staged input directory: {self.comfyui_input_dir}")
+
+    def _storage_roots(self, kind):
+        roots = []
+        for line in self.GetConfigEntryWithDefault("AllowedStorageRoots", "").replace(";", "\n").splitlines():
+            path = line.strip()
+            if not path:
+                continue
+            if path.endswith(("\\*", "/*")):
+                path = path[:-1]
+            if "*" in path or "?" in path or not os.path.isabs(path):
+                raise ComfyUIError("Allowed Storage Locations needs one absolute folder or drive pattern per line, e.g. X:\\*.")
+            roots.append(path)
+        install = self._resolve_comfyui_install_path()
+        if install:
+            roots.append(os.path.join(install, "ComfyUI", kind))
+        default = self.GetConfigEntryWithDefault("DefaultOutputDirectory", "")
+        if default:
+            roots.append(default)
+        return [RepositoryUtils.CheckPathMapping(root) for root in roots]
 
     def _create_directory(self, directory_path: str, description: str):
         """Create a directory with error handling"""
@@ -661,9 +733,8 @@ class ComfyUI(DeadlinePlugin):
             self.use_existing_comfyui, self.server_started = True, True
             self.LogInfo(f"Reusing verified ComfyUI endpoint {endpoint}; its running session determines GPU and this task queues only its own prompts.")
             return self.comfyui_port
-        if self._is_port_in_use(port):
-            raise ComfyUIError(f"Configured endpoint port {port} is occupied by an unverified service; refusing another port or replacement.")
-        self.LogInfo(f"Configured endpoint unavailable; fallback will start only at {endpoint}.")
+        self._check_launch_port(port)
+        self.LogInfo(f"Configured endpoint unavailable; starting isolated ComfyUI at {self.comfyui_api_url}.")
         return self.comfyui_port
 
     def _determine_final_port(self, base_port: int) -> str:
@@ -673,13 +744,14 @@ class ComfyUI(DeadlinePlugin):
         self.use_existing_comfyui = False
         if worker_mode or distributed_mode:
             worker_port = self._calculate_worker_port(base_port)
-            self.comfyui_port = self._find_available_port(worker_port)
+            self.comfyui_port = str(worker_port)
             self.LogInfo(f"Worker/distributed mode: starting isolated ComfyUI on port {self.comfyui_port}")
         else:
-            self.comfyui_port = self._find_available_port(base_port)
+            self.comfyui_port = str(base_port)
             self.LogInfo(f"Normal render mode: starting isolated ComfyUI on port {self.comfyui_port}")
 
         self.comfyui_api_url = f"http://127.0.0.1:{self.comfyui_port}"
+        self._check_launch_port(int(self.comfyui_port))
         
         return self.comfyui_port
 
@@ -707,6 +779,10 @@ class ComfyUI(DeadlinePlugin):
         self.LogInfo("ComfyUI PreRenderTasks started.")
         
         try:
+            self.server_started = False
+            self.workflow_submitted = False
+            self.thread_running = True
+            self.submission_error = ""
             self._setup_batch_processing()
             self._load_worker_endpoint_policy()
             comfyui_path = self._resolve_comfyui_install_path()
@@ -727,30 +803,30 @@ class ComfyUI(DeadlinePlugin):
         self.temp_dir = self.CreateTempDirectory("comfyui_job")
 
     def _is_port_in_use(self, port: int) -> bool:
-        """Check if the given port is already in use"""
+        """Check whether a new server can bind the port."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                result = s.connect_ex(('127.0.0.1', port))
-                return result == 0
-        except:
+                if os.name == "nt":
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                s.bind(('0.0.0.0', port))
             return False
+        except OSError:
+            return True
     
-    def _find_available_port(self, start_port: int) -> str:
-        """Find an available port starting from start_port"""
-        port = start_port
-        max_port = start_port + MAX_PORT_SEARCH_RANGE
-        
-        while port < max_port:
-            if not self._is_port_in_use(port):
-                return str(port)
-            port += 1
-        
-        return str(start_port)
+    def _check_launch_port(self, port: int):
+        if not 1 <= port <= 65535:
+            raise ComfyUIError(f"ComfyUI port {port} is outside the TCP port range.")
+        if self._is_port_in_use(port):
+            raise ComfyUIError(
+                f"ComfyUI port {port} is already in use on worker {self.GetSlaveName()}. "
+                "Stop the previous instance or set a different ComfyUIPort base. "
+                "Each GPU must have only one active Deadline worker/task."
+            )
 
     def PostRenderTasks(self):
         """Cleanup tasks after rendering"""
         self.LogInfo("ComfyUI PostRenderTasks started.")
+        self.thread_running = False
 
         if not self.task_completed:
             message = self.submission_error or (
@@ -835,6 +911,8 @@ class ComfyUI(DeadlinePlugin):
         # If using existing ComfyUI instance, return dummy command
         if self.use_existing_comfyui:
             return self._create_dummy_command()
+
+        self._check_launch_port(int(self.comfyui_port))
         
         # Build arguments for new ComfyUI instance
         return self._build_comfyui_arguments(comfyui_main_py)
@@ -849,21 +927,8 @@ class ComfyUI(DeadlinePlugin):
         workflow_thread.daemon = True
         workflow_thread.start()
         
-        dummy_script = self._get_dummy_script()
-        encoded = base64.b64encode(dummy_script.encode("utf-8")).decode("ascii")
-        return f'-c "import base64;exec(base64.b64decode(\'{encoded}\'))"'
-
-    def _get_dummy_script(self) -> str:
-        """Wait for this task's completion marker; Deadline cancellation remains authoritative."""
-        return """import json, os, sys, time
-marker = %r
-while not os.path.exists(marker):
-    time.sleep(1)
-with open(marker, 'r') as handle:
-    result = json.load(handle)
-os.remove(marker)
-sys.exit(0 if result.get('success') else 1)
-""" % self.reuse_completion_marker
+        waiter = os.path.join(os.path.dirname(__file__), "reuse_waiter.py")
+        return subprocess.list2cmdline(["-s", waiter, self.reuse_completion_marker])
 
     def _signal_reuse_waiter(self, success):
         if self.reuse_completion_marker:
@@ -882,13 +947,16 @@ sys.exit(0 if result.get('success') else 1)
             args_list.append("-s")
 
         # Add main script and port
-        args_list.append(f'"{comfyui_main_py}"')
-        args_list.append(f"--port {port}")
+        args_list.append(comfyui_main_py)
+        args_list.extend(["--port", str(int(port))])
+        database_path = os.path.abspath(os.path.join(self.temp_dir, f"comfyui-{uuid.uuid4().hex}.db"))
+        database_url = "sqlite:///" + database_path.replace("\\", "/")
+        args_list.extend(["--database-url", database_url])
 
         # Add CUDA device argument
         cuda_arg = self._get_cuda_device_arg()
         if cuda_arg:
-            args_list.append(cuda_arg)
+            args_list.extend(["--cuda-device", str(int(cuda_arg.split()[-1]))])
         
         # Add ComfyUI flags for worker mode
         worker_mode, distributed_mode, force_new_instance = get_distributed_config_for_plugin(self)
@@ -910,25 +978,29 @@ sys.exit(0 if result.get('success') else 1)
         if not 0 <= reserve_vram <= 64:
             raise ValueError("ReserveVRAM must be between 0 and 64 GB")
         if reserve_vram > 0:
-            args_list.append(f"--reserve-vram {reserve_vram:g}")
+            args_list.extend(["--reserve-vram", f"{reserve_vram:g}"])
 
         # Add output directory if custom one was specified
         if self.custom_output_dir_specified and self.comfyui_output_dir:
-            args_list.append(f'--output-directory "{self.comfyui_output_dir}"')
+            args_list.extend(["--output-directory", self.comfyui_output_dir])
             self.LogInfo(f"Passing --output-directory \"{self.comfyui_output_dir}\" to ComfyUI.")
         else:
             self.LogInfo("Not passing --output-directory to ComfyUI, it will use its default.")
 
         if self.comfyui_input_dir:
-            args_list.append(f'--input-directory "{self.comfyui_input_dir}"')
+            args_list.extend(["--input-directory", self.comfyui_input_dir])
             self.LogInfo(f"Passing --input-directory \"{self.comfyui_input_dir}\" to ComfyUI.")
 
-        args = " ".join(args_list)
+        if any(any(c in arg for c in '\x00\r\n"') for arg in args_list):
+            raise ComfyUIError("Invalid command line argument.")
+        args = subprocess.list2cmdline(args_list)
         self.LogInfo(f"Render Arguments: {args}")
         return args
 
     def HandleServerStarted(self):
         """Called when the ComfyUI server has started"""
+        if self.GetRegexMatch(1) != self.comfyui_port or not self.thread_running:
+            return
         # Prevent multiple triggers from stdout handlers
         if self.workflow_submitted:
             self.LogInfo("ComfyUI server startup detected, but workflow already submitted - ignoring")
@@ -959,6 +1031,9 @@ sys.exit(0 if result.get('success') else 1)
         if not self.thread_running:
             self.LogInfo("Thread stopping due to task completion")
             return {'status_code': 0, 'text': '', 'json': lambda: {}}
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port or parsed.username or parsed.password or parsed.fragment:
+            raise ComfyUIError("ComfyUI API requests must use a local HTTP endpoint without credentials.")
             
         if verbose:
             self.LogInfo(f"Making {method} request to {url}")
@@ -973,7 +1048,8 @@ sys.exit(0 if result.get('success') else 1)
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), LocalAPIHandler())
+            with opener.open(req, timeout=30) as response:
                 response_data = response.read().decode('utf-8')
                 return {
                     'status_code': response.status,
@@ -1193,7 +1269,7 @@ sys.exit(0 if result.get('success') else 1)
 
     def _resolve_workflow_file_path(self, workflow_file: str) -> str:
         """Resolve absolute or auxiliary-file-relative workflow paths."""
-        workflow_file = (workflow_file or "").strip().strip('"')
+        workflow_file = (workflow_file or "").strip()
         if not workflow_file:
             return ""
 
@@ -1202,29 +1278,18 @@ sys.exit(0 if result.get('success') else 1)
         except Exception:
             mapped = workflow_file
 
-        if os.path.isabs(mapped):
-            return mapped
-
-        candidates = []
+        roots = []
         data_filename = self.GetDataFilename()
         if data_filename:
-            candidates.append(os.path.join(os.path.dirname(data_filename), mapped))
-
-        try:
-            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), mapped))
-        except Exception:
-            pass
-
+            roots.append(os.path.dirname(os.path.abspath(data_filename)))
         if self.temp_dir:
-            candidates.append(os.path.join(self.temp_dir, mapped))
-
-        candidates.append(os.path.abspath(mapped))
-
+            roots.append(self.temp_dir)
+        if not roots:
+            raise ComfyUIError("Deadline did not provide a job auxiliary directory.")
+        if os.path.isabs(mapped):
+            return approved_path(mapped, roots)
+        candidates = [approved_path(os.path.join(root, mapped), [root]) for root in roots]
         for candidate in candidates:
-            try:
-                candidate = RepositoryUtils.CheckPathMapping(candidate)
-            except Exception:
-                pass
             if os.path.exists(candidate):
                 return candidate
 
@@ -1368,6 +1433,9 @@ sys.exit(0 if result.get('success') else 1)
     
     def HandleStdoutPromptExecuted(self):
         """Handle completion message 'Prompt executed in X seconds'"""
+        if self.GetPluginInfoEntryWithDefault("SpoolRequestFile", ""):
+            self.LogInfo("Spool waits for verified history and terminal receipt; stdout is advisory")
+            return
         execution_time = self.GetRegexMatch(1)
         self.LogInfo(f"Workflow completed in {execution_time} seconds")
         
@@ -1448,7 +1516,7 @@ sys.exit(0 if result.get('success') else 1)
         if not self.task_completed:
             self.FailRender(f"ComfyUI error: {error_msg}")
 
-    def initialize_api_connection(self) -> bool:
+    def initialize_api_connection(self, workflow_data: dict) -> bool:
         """Initialize connection to ComfyUI API and get client ID"""
         try:
             time.sleep(2)  # Wait for server to be fully initialized
@@ -1461,15 +1529,31 @@ sys.exit(0 if result.get('success') else 1)
                 
             self.client_id = f"deadline-{uuid.uuid4().hex}"
             self.LogInfo(f"Got client ID: {self.client_id}")
-            object_info_response = self.http_request(f"{self.comfyui_api_url}/object_info")
-            if object_info_response['status_code'] != 200:
-                raise ComfyUIError(
-                    f"Worker {self.GetSlaveName()} did not return /object_info "
-                    f"(HTTP {object_info_response['status_code']})."
-                )
-            self.object_info = object_info_response['json']()
-            if not isinstance(self.object_info, dict) or not self.object_info:
-                raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid /object_info data.")
+            node_types = sorted({node["class_type"] for node in workflow_data.values()
+                                 if isinstance(node, dict) and isinstance(node.get("class_type"), str) and node["class_type"]})
+            self.object_info = {}
+            for class_type in node_types:
+                url = f"{self.comfyui_api_url}/object_info/{urllib.parse.quote(class_type, safe='')}"
+                try:
+                    object_info_response = self.http_request(url)
+                except OSError as e:
+                    raise ComfyUIError(
+                        f"Worker {self.GetSlaveName()} could not return metadata for node type "
+                        f"'{class_type}' from {url}: {e}"
+                    ) from e
+                if object_info_response['status_code'] != 200:
+                    raise ComfyUIError(
+                        f"Worker {self.GetSlaveName()} did not return metadata for node type "
+                        f"'{class_type}' (HTTP {object_info_response['status_code']})."
+                    )
+                definitions = object_info_response['json']()
+                if not isinstance(definitions, dict):
+                    raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid metadata for '{class_type}'.")
+                if class_type in definitions:
+                    if not isinstance(definitions[class_type], dict):
+                        raise ComfyUIError(f"Worker {self.GetSlaveName()} returned invalid metadata for '{class_type}'.")
+                    self.object_info[class_type] = definitions[class_type]
+            self.LogInfo(f"Loaded metadata for {len(self.object_info)} workflow node types on worker {self.GetSlaveName()}")
             return True
         except Exception as e:
             self.LogWarning(f"Error initializing API connection: {e}")
@@ -1664,20 +1748,27 @@ sys.exit(0 if result.get('success') else 1)
                         class_type in {"LoadImage", "LoadImageMask", "LoadAudio", "LoadVideo"}
                         and input_name in {"image", "audio", "video", "file"}
                     ) or input_name in STAGED_FILE_INPUTS.get(class_type, set())
+                    is_path_file = input_name in ABSOLUTE_FILE_INPUTS.get(class_type, set())
                     value = node.get("inputs", {}).get(input_name)
-                    if not is_staged_file or not isinstance(value, str):
+                    if not (is_staged_file or is_path_file) or not isinstance(value, str):
                         continue
                     clean_value = re.sub(r"\s+\[(input|output|temp)\]\s*$", "", value.strip())
                     root = self.reuse_gui_input_root if self.use_existing_comfyui else self.comfyui_input_dir
-                    candidate = os.path.abspath(os.path.join(root, clean_value))
+                    if not root:
+                        root = os.path.join(self.comfyui_install_path, "ComfyUI", "input")
                     try:
-                        safe = not os.path.isabs(clean_value) and os.path.commonpath([os.path.abspath(root), candidate]) == os.path.abspath(root)
-                    except ValueError:
-                        safe = False
-                    if not safe or not os.path.isfile(candidate):
+                        if not is_path_file and (os.path.isabs(clean_value) or ntpath.splitdrive(clean_value)[0]):
+                            raise ComfyUIError("Upload input paths must be relative.")
+                        roots = [root]
+                        if is_path_file and self.comfyui_input_dir:
+                            roots.append(self.comfyui_input_dir)
+                        candidate = approved_path(os.path.join(root, clean_value), roots)
+                        if not os.path.isfile(candidate):
+                            raise ComfyUIError("Staged file is missing.")
+                    except ComfyUIError as exc:
                         raise ComfyUIError(
                             f"Headless preflight rejected invalid staged path on {context}, input '{input_name}': {value}"
-                        )
+                        ) from exc
             if definition.get("output_node") and re.search(r"save|preview|video|image|audio", class_type, re.I):
                 expected_outputs.append(str(node_id))
 
@@ -1707,6 +1798,13 @@ sys.exit(0 if result.get('success') else 1)
 
     def _queue_prompt(self, workflow_data: dict, deadline_metadata: dict, workflow_metadata: dict = None) -> bool:
         """Queue one prepared variation prompt to ComfyUI."""
+        for node in workflow_data.values():
+            prefix = node.get("inputs", {}).get("filename_prefix")
+            if isinstance(prefix, str):
+                # Prefixes are names inside output storage, never a second root.
+                if os.path.isabs(prefix) or ntpath.splitdrive(prefix)[0]:
+                    raise ComfyUIError("Output filename prefixes must be relative.")
+                approved_path(os.path.join(self.comfyui_output_dir, prefix), [self.comfyui_output_dir])
         extra_pnginfo = {"deadline": deadline_metadata}
         if workflow_metadata is not None:
             extra_pnginfo["workflow"] = workflow_metadata
@@ -1718,6 +1816,18 @@ sys.exit(0 if result.get('success') else 1)
                 "extra_pnginfo": extra_pnginfo
             },
         }
+        package_file = self.GetPluginInfoEntryWithDefault("SpoolRequestFile", "")
+        spool_execution = None
+        if package_file:
+            package_path = self._resolve_workflow_file_path(package_file)
+            with open(package_path, encoding="utf-8") as handle:
+                package = json.load(handle)
+            package["resultRoot"] = approved_path(RepositoryUtils.CheckPathMapping(package["resultRoot"]), [self.comfyui_output_dir])
+            if os.path.normcase(os.path.realpath(package["resultRoot"])) != os.path.normcase(os.path.realpath(self.comfyui_output_dir)):
+                raise ComfyUIError("Spool result root must match the job output directory.")
+            input_root = self.reuse_gui_input_root if self.use_existing_comfyui else self.comfyui_input_dir
+            spool_execution = spool_protocol.prepare_execution(package, workflow_data, input_root, deadline_metadata["variation_index"])
+            data["prompt"] = spool_execution["prompt"]
         response = self.http_request(f"{self.comfyui_api_url}/prompt", method="POST", data=data)
         
         if response['status_code'] != 200:
@@ -1734,12 +1844,19 @@ sys.exit(0 if result.get('success') else 1)
         
         self.prompt_id = response['json']()['prompt_id']
         self.prompt_ids.append(self.prompt_id)
+        if spool_execution:
+            if not hasattr(self, "spool_executions"):
+                self.spool_executions = {}
+            self.spool_executions[self.prompt_id] = (package, spool_execution)
         self.LogInfo(f"Queued variation {deadline_metadata['variation_index']} with prompt ID: {self.prompt_id}")
         self.workflow_submitted = True
         return True
 
     def _prepare_variation_prompt(self, workflow_data: dict, variation_index: int):
         """Deep-copy and rewrite Deadline seed nodes for one global variation index."""
+        spool_job = bool(self.GetPluginInfoEntryWithDefault("SpoolRequestFile", ""))
+        if spool_job and int(variation_index) != 0:
+            raise ComfyUIError("Spool seeds are frozen; only variation zero is allowed.")
         prompt_workflow = copy.deepcopy(workflow_data)
         if self.use_existing_comfyui:
             self._stage_reused_endpoint_inputs(prompt_workflow)
@@ -1751,16 +1868,18 @@ sys.exit(0 if result.get('success') else 1)
             node_type = node.get("class_type")
             inputs = node.setdefault("inputs", {})
             base_seed = int(inputs.get("seed", 0))
-            actual_seed = base_seed + int(variation_index)
-            inputs["seed"] = actual_seed
-            inputs["task_id"] = 0
-            inputs["batch_mode"] = False
+            actual_seed = base_seed if spool_job else base_seed + int(variation_index)
+            if not spool_job:
+                inputs["seed"] = actual_seed
+                inputs["task_id"] = 0
+                inputs["batch_mode"] = False
             seeds.append({
                 "node_id": str(node_id),
                 "base_seed": base_seed,
                 "actual_seed": actual_seed,
             })
-            self.LogInfo(f"{node_type} node {node_id}: base {base_seed}, variation {variation_index}, actual {actual_seed}")
+            self.LogInfo(f"{node_type} node {node_id}: base {base_seed}, variation {variation_index}, actual {actual_seed}"
+                         + ("; preserving frozen Spool inputs" if spool_job else ""))
 
         metadata = {
             "job_id": getattr(self.GetJob(), "JobId", ""),
@@ -1792,13 +1911,17 @@ sys.exit(0 if result.get('success') else 1)
                 if not isinstance(value, str) or os.path.isabs(value):
                     continue
                 candidate = os.path.normcase(os.path.abspath(os.path.join(root, value)))
-                if candidate.startswith(root + os.sep) and os.path.isfile(candidate):
-                    task_root = os.path.join(self.reuse_gui_input_root, "deadline", self.submission_id or uuid.uuid4().hex)
+                if candidate.startswith(root + os.sep):
+                    candidate = approved_path(candidate, [root])
+                    if not os.path.isfile(candidate):
+                        continue
+                    submission_id = self.submission_id or uuid.uuid4().hex
+                    if not re.fullmatch(r"[A-Za-z0-9_-]+", submission_id):
+                        raise ComfyUIError("Invalid SubmissionId.")
+                    task_root = approved_path(os.path.join(self.reuse_gui_input_root, "deadline", submission_id), [self.reuse_gui_input_root])
                     relative = os.path.relpath(candidate, root)
-                    destination = os.path.normcase(os.path.abspath(os.path.join(task_root, relative)))
+                    destination = approved_path(os.path.join(task_root, relative), [task_root])
                     gui_root = os.path.normcase(os.path.abspath(self.reuse_gui_input_root))
-                    if not destination.startswith(gui_root + os.sep):
-                        raise ComfyUIError("Unsafe GUI input staging path.")
                     try:
                         os.makedirs(os.path.dirname(destination), exist_ok=True)
                         shutil.copy2(candidate, destination)
@@ -1843,6 +1966,11 @@ sys.exit(0 if result.get('success') else 1)
         self._handle_prompt_status(status)
         # Failed history can contain partial outputs. Only explicit success counts.
         if status.get('status_str') == 'success' and status.get('completed') is True:
+            if self.prompt_id in getattr(self, "spool_executions", {}):
+                package, physical = self.spool_executions[self.prompt_id]
+                roots = {"output": self.reuse_gui_output_root if self.use_existing_comfyui else self.comfyui_output_dir,
+                         "temp": os.path.join(self.comfyui_install_path, "ComfyUI", "temp")}
+                spool_protocol.finalize(package, physical, self.prompt_id, entry, roots, self.GetSlaveName(), str(self.GetJob().JobId))
             return self._handle_prompt_completion(entry.get('outputs', {}))
         return False
 
@@ -1915,8 +2043,6 @@ sys.exit(0 if result.get('success') else 1)
 
         if self.use_existing_comfyui and self.custom_output_dir_specified:
             gui_output = self.reuse_gui_output_root
-            output_root = os.path.normcase(os.path.abspath(gui_output))
-            target_root = os.path.normcase(os.path.abspath(self.comfyui_output_dir))
             copied = 0
             for node_outputs in outputs.values():
                 for group in ("images", "gifs", "videos"):
@@ -1927,10 +2053,8 @@ sys.exit(0 if result.get('success') else 1)
                         if not filename:
                             continue
                         relative = os.path.join(item.get("subfolder", ""), filename)
-                        source = os.path.normcase(os.path.abspath(os.path.join(gui_output, relative)))
-                        target = os.path.normcase(os.path.abspath(os.path.join(self.comfyui_output_dir, relative)))
-                        if not source.startswith(output_root + os.sep) or not target.startswith(target_root + os.sep):
-                            raise ComfyUIError(f"ComfyUI history returned unsafe output path: {relative}")
+                        source = approved_path(os.path.join(gui_output, relative), [gui_output])
+                        target = approved_path(os.path.join(self.comfyui_output_dir, relative), [self.comfyui_output_dir])
                         if not os.path.isfile(source):
                             raise ComfyUIError(f"Expected this task's output is missing from GUI endpoint: {relative}")
                         try:
@@ -1966,9 +2090,11 @@ sys.exit(0 if result.get('success') else 1)
         temp_root = os.path.join(self.comfyui_install_path, "ComfyUI", "temp")
         for node_id, item in file_items:
             kind = item.get("type", "output")
+            if kind not in ("temp", "output"):
+                raise ComfyUIError("ComfyUI history returned an unknown storage type.")
             root = temp_root if kind == "temp" else output_root
             relative = os.path.join(str(item.get("subfolder", "")), str(item["filename"]))
-            candidate = os.path.abspath(os.path.join(root, relative))
+            candidate = approved_path(os.path.join(root, relative), [root])
             normalized_root = os.path.abspath(root)
             try:
                 safe = os.path.commonpath([normalized_root, candidate]) == normalized_root
@@ -2230,7 +2356,7 @@ sys.exit(0 if result.get('success') else 1)
 
             self._load_standard_workflow_metadata()
             
-            if not self.initialize_api_connection():
+            if not self.initialize_api_connection(workflow_data):
                 raise ComfyUIError("Could not initialize the ComfyUI API connection.")
             
             if not self.queue_workflow(workflow_data):

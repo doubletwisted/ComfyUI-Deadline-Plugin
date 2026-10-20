@@ -30,7 +30,15 @@ Label=Default Output Directory (Optional)
 Category=Configuration
 Index=1
 Default=
-Description=Optional default output directory. If blank, uses ComfyUI's default output folder. This can be overridden per job.
+Description=Optional default for jobs without an output path. This directory is also approved storage. ComfyUI users enter full output paths in the submit node.
+
+[AllowedStorageRoots]
+Type=multilinestring
+Label=Allowed Storage Locations (Optional)
+Category=Configuration
+Index=3
+Default=G:\*;X:\input\*;X:\outputs\*;X:\playground\*;Y:\*;\\NAS02\grajdolek\*;\\NAS02\Comfy\input\*;\\NAS02\Comfy\outputs\*;\\NAS02\Comfy\playground\*;\\NAS04\3d-02\*
+Description=Approved input and output locations, one per line. Both drive-letter and UNC rules are supported. Mapped network paths are converted to UNC before submission and checked against the UNC rules. A folder also allows all its subfolders. Default Output Directory and local ComfyUI input/output folders are already allowed.
 
 [ComfyUIWorkerEndpoints]
 Type=multilinestring

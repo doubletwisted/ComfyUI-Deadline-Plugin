@@ -7,7 +7,9 @@ prompt, stages referenced input assets, and submits a render job to Deadline.
 
 import copy
 import filecmp
+import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -55,6 +57,60 @@ MEDIA_EXTENSIONS = {
 DEADLINE_ENDPOINT_SESSION_ID = uuid.uuid4().hex
 
 
+def _validate_path_text(path: str) -> None:
+    if not isinstance(path, str) or not path or any(c in path for c in '\x00\r\n"'):
+        raise ValueError("Path must be nonempty and contain no quotes or control characters.")
+    normalized = path.replace("\\", "/")
+    if normalized.startswith(("//?/", "//./")):
+        raise ValueError("Windows device paths are not allowed.")
+    _, tail = ntpath.splitdrive(path)
+    for part in tail.replace("\\", "/").split("/"):
+        if not part or part == ".":
+            continue
+        if part == ".." or part.rstrip(" .") != part or ":" in part or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part):
+            raise ValueError("Path contains traversal, a device name, or an alternate data stream.")
+
+
+def _approved_path(path: str, roots: List[str]) -> str:
+    _validate_path_text(path)
+    if not os.path.isabs(path):
+        raise ValueError("An absolute path inside an approved storage root is required.")
+    # Preserve the rooted UNC share anchor, including when realpath drops its slash.
+    candidate = os.path.normpath(os.path.abspath(path) + os.sep)
+    for root in roots:
+        _validate_path_text(root)
+        if not os.path.isabs(root):
+            raise ValueError("Approved storage roots must be absolute paths.")
+        # Check the spelling before resolving links: an unapproved UNC path must
+        # never cause a connection (and Windows authentication) to another host.
+        root = os.path.normpath(os.path.abspath(root) + os.sep)
+        try:
+            if os.path.commonpath([os.path.normcase(root), os.path.normcase(candidate)]) != os.path.normcase(root):
+                continue
+            real_root = os.path.normcase(os.path.normpath(os.path.realpath(root) + os.sep))
+            real_candidate = os.path.normcase(os.path.normpath(os.path.realpath(candidate) + os.sep))
+            if os.path.commonpath([real_root, real_candidate]) == real_root:
+                return candidate
+        except ValueError:
+            continue
+    raise ValueError("Path is outside the approved storage roots.")
+
+
+def _deadline_value(value: Any) -> str:
+    value = str(value)
+    if any(c in value for c in "\r\n\x00"):
+        raise ValueError("Deadline job values cannot contain newlines or NUL characters.")
+    return value
+
+
+def _farm_path(path: str, settings: Dict[str, Any]) -> str:
+    drive, tail = ntpath.splitdrive(path)
+    network_root = settings.get("drive_mappings", {}).get(drive.upper())
+    if network_root:
+        return ntpath.join(network_root, tail.lstrip("\\/"))
+    return path
+
+
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -91,7 +147,7 @@ class DeadlineCommandHelper:
         candidates.append(DEADLINE_COMMAND_PATHS["windows"] if sys.platform.startswith("win") else DEADLINE_COMMAND_PATHS["linux"])
 
         for candidate in candidates:
-            if os.path.exists(candidate):
+            if os.path.isabs(candidate) and os.path.isfile(candidate):
                 return candidate
         return ""
 
@@ -118,6 +174,7 @@ class DeadlineCommandHelper:
             stderr=subprocess.PIPE,
             startupinfo=startupinfo,
             creationflags=creationflags,
+            shell=False,
         )
         stdout, stderr = process.communicate()
         output = stdout.decode(errors="replace") if isinstance(stdout, bytes) else str(stdout)
@@ -133,6 +190,35 @@ class DeadlineCommandHelper:
             if token.startswith("JobID="):
                 return token.split("=", 1)[1].strip()
         return ""
+
+    @staticmethod
+    def get_farm_settings() -> Dict[str, Any]:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "read_farm_settings.py")
+        output = DeadlineCommandHelper.call_deadline_command(["-ExecuteScriptNoGui", script])
+        marker = "COMFY_DEADLINE_FARM_SETTINGS="
+        for line in output.splitlines():
+            if not line.startswith(marker):
+                continue
+            settings = json.loads(line[len(marker):])
+            if not isinstance(settings, dict):
+                raise ValueError("Deadline returned invalid farm storage settings.")
+            for key in ("output_roots", "input_roots"):
+                roots = settings.get(key)
+                if not isinstance(roots, list):
+                    raise ValueError("Deadline returned invalid farm storage roots.")
+                for root in roots:
+                    _validate_path_text(root)
+                    if not os.path.isabs(root):
+                        raise ValueError("Farm storage roots must be absolute paths.")
+            mappings = settings.get("drive_mappings", {})
+            if not isinstance(mappings, dict):
+                raise ValueError("Deadline returned invalid drive mappings.")
+            for drive, network_root in mappings.items():
+                _validate_path_text(network_root)
+                if not re.fullmatch(r"[A-Z]:", drive) or not network_root.startswith("\\\\"):
+                    raise ValueError("Deadline returned invalid drive mappings.")
+            return settings
+        raise RuntimeError("Could not read ComfyUI farm settings from Deadline. Check the Deadline Client connection.")
 
 
 class WorkflowProcessor:
@@ -175,6 +261,7 @@ class InputAssetStager:
         self.output_directory = os.path.abspath(output_directory)
         self.job_name = job_name
         self.submission_id = submission_id
+        self.farm_settings = None
 
     def stage_referenced_assets(self, prompt: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, Any]]]:
         input_dir = self._get_local_input_directory()
@@ -267,7 +354,7 @@ class InputAssetStager:
         return references
 
     def _resolve_destination(self, staging_dir: str, rel_path: str, source_path: str) -> Tuple[str, str]:
-        destination_path = os.path.abspath(os.path.join(staging_dir, rel_path))
+        destination_path = _approved_path(os.path.join(staging_dir, rel_path), [staging_dir])
         if not os.path.exists(destination_path):
             return rel_path, destination_path
 
@@ -276,7 +363,10 @@ class InputAssetStager:
 
         stem, extension = os.path.splitext(rel_path)
         staged_rel_path = f"{stem}_{self.submission_id}{extension}"
-        return staged_rel_path, os.path.abspath(os.path.join(staging_dir, staged_rel_path))
+        destination_path = _approved_path(os.path.join(staging_dir, staged_rel_path), [staging_dir])
+        if os.path.lexists(destination_path):
+            raise ValueError("Staged input collision would overwrite an existing file.")
+        return staged_rel_path, destination_path
 
     def _resolve_input_file(
         self,
@@ -296,20 +386,19 @@ class InputAssetStager:
         if os.path.isabs(clean_value):
             if not allow_absolute:
                 return None
-            candidate = os.path.abspath(clean_value)
+            try:
+                candidate = _approved_path(clean_value, [input_dir])
+            except ValueError:
+                if self.farm_settings is None:
+                    self.farm_settings = DeadlineCommandHelper.get_farm_settings()
+                candidate = _approved_path(_farm_path(clean_value, self.farm_settings), [input_dir] + self.farm_settings["input_roots"])
             if not os.path.isfile(candidate):
                 if not strict:
                     return None
                 raise FileNotFoundError(f"Referenced input asset was not found: {value} ({candidate})")
             return clean_value, candidate
 
-        candidate = os.path.abspath(os.path.join(input_dir, clean_value))
-        try:
-            common = os.path.commonpath([input_dir, candidate])
-        except ValueError:
-            common = ""
-        if common != input_dir:
-            raise ValueError(f"Input asset escapes ComfyUI input directory: {value}")
+        candidate = _approved_path(os.path.join(input_dir, clean_value), [input_dir])
         if not os.path.isfile(candidate):
             if not strict:
                 return None
@@ -325,10 +414,12 @@ class InputAssetStager:
         return match.group(1).strip().replace("/", os.sep), match.group(2)
 
     def _staging_directory(self) -> str:
-        parent = os.path.dirname(self.output_directory.rstrip("\\/"))
-        return os.path.join(parent, "input")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.submission_id):
+            raise ValueError("Submission ID must contain only letters, digits, underscores, or hyphens.")
+        return _approved_path(os.path.join(self.output_directory, ".deadline-inputs", self.submission_id), [self.output_directory])
 
     def _write_manifest(self, manifest_path: str, manifest: Dict[str, Any]) -> None:
+        _approved_path(manifest_path, [self._staging_directory()])
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
 
@@ -360,6 +451,11 @@ class DeadlineJobSubmitter:
             json.dump(self.workflow_data, handle, indent=2)
 
         auxiliary_files = [prompt_file]
+        if config_package := self.job_config.get("spool_package"):
+            package_file = os.path.join(submission_dir, "spool_request.json")
+            with open(package_file, "w", encoding="utf-8") as handle:
+                json.dump(config_package, handle, ensure_ascii=False, indent=2)
+            auxiliary_files.append(package_file)
         standard_workflow = self.job_config.get("standard_workflow")
         if standard_workflow:
             with open(standard_workflow_file, "w", encoding="utf-8") as handle:
@@ -376,6 +472,11 @@ class DeadlineJobSubmitter:
         chunk_size = max(1, int(config["chunk_size"]))
         output_dir = os.path.abspath(config["output_directory"])
 
+        for key in ("job_name", "comment", "department", "pool", "group", "output_directory"):
+            _deadline_value(config.get(key, ""))
+        if config.get("spool_package"):
+            for key in ("submissionId", "attemptId"):
+                _deadline_value(config["spool_package"][key])
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("Plugin=ComfyUI\n")
             handle.write(f"Name={config['job_name']}\n")
@@ -387,6 +488,11 @@ class DeadlineJobSubmitter:
             handle.write(f"Frames=0-{batch_count - 1}\n")
             handle.write(f"ChunkSize={chunk_size}\n")
             handle.write(f"OutputDirectory0={output_dir}\n")
+            if config.get("spool_package"):
+                package = config["spool_package"]
+                handle.write("ExtraInfo0=spool:" + package["submissionId"] + "\n")
+                handle.write("ExtraInfoKeyValue0=SpoolSubmissionId=" + package["submissionId"] + "\n")
+                handle.write("ExtraInfoKeyValue1=SpoolAttemptId=" + package["attemptId"] + "\n")
             machine_list = config.get("machine_list", "")
             if machine_list:
                 if not re.fullmatch(r"[A-Za-z0-9_,.\-]+", machine_list):
@@ -396,6 +502,7 @@ class DeadlineJobSubmitter:
     def _write_plugin_info(self, path: str) -> None:
         config = self.job_config
         entries = {
+            "SpoolRequestFile": "spool_request.json" if config.get("spool_package") else "",
             "StandardWorkflowFile": "workflow.json" if config.get("standard_workflow") else "",
             "JobOutputDirectory": os.path.abspath(config["output_directory"]),
             "JobInputDirectory": os.path.abspath(config["input_directory"]),
@@ -415,7 +522,7 @@ class DeadlineJobSubmitter:
         with open(path, "w", encoding="utf-8") as handle:
             for key, value in entries.items():
                 if value != "":
-                    handle.write(f"{key}={value}\n")
+                    handle.write(f"{key}={_deadline_value(value)}\n")
 
 
 class DeadlineSeed:
@@ -486,7 +593,8 @@ class DeadlineSubmitNode:
                 "output_directory": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "placeholder": "Farm-visible output directory",
+                    "placeholder": "Full farm-visible output path",
+                    "tooltip": "Enter a full output path, e.g. X:\\outputs\\shot010. It must be inside the admin's Allowed Storage Locations in Deadline.",
                 }),
                 "batch_count": ("INT", {
                     "default": NodeDefaults.BATCH_COUNT,
@@ -574,7 +682,10 @@ class DeadlineSubmitNode:
             output_directory = self._prepare_output_directory(output_directory)
             batch_count = max(1, int(batch_count))
             chunk_size = max(1, min(int(chunk_size), batch_count))
-            submission_id = uuid.uuid4().hex[:12]
+            spool_package = copy.deepcopy((extra_pnginfo or {}).get("spoolSubmission"))
+            if spool_package and (batch_count != 1 or chunk_size != 1):
+                raise ValueError("Spool jobs require one assigned take per job")
+            submission_id = spool_package["submissionId"] if spool_package else uuid.uuid4().hex[:12]
 
             if prompt is None:
                 raise ValueError("ComfyUI did not inject the current API prompt.")
@@ -586,7 +697,23 @@ class DeadlineSubmitNode:
             standard_workflow = self._extract_standard_workflow(extra_pnginfo)
             self._rewrite_standard_workflow_assets(standard_workflow, assets)
 
+            if spool_package:
+                spool_package["stagedPrompt"] = copy.deepcopy(worker_prompt)
+                spool_package["resultRoot"] = output_directory
+                for asset in spool_package["assets"]:
+                    value = worker_prompt[asset["nodeId"]]["inputs"][asset["input"]]
+                    staged = _approved_path(os.path.join(input_dir, value), [input_dir])
+                    with open(staged, "rb") as handle:
+                        digest = hashlib.sha256(handle.read()).hexdigest()
+                    if digest != asset["sha256"] or os.path.getsize(staged) != asset["byteSize"]:
+                        raise ValueError("Stager changed a frozen Spool dependency")
+                    asset["staged"] = value
+                from .spool_protocol import atomic_json
+                package_dir = _approved_path(os.path.join(output_directory, "spool-submissions", submission_id), [output_directory])
+                _approved_path(os.path.join(package_dir, "request.json"), [output_directory])
+                atomic_json(os.path.join(package_dir, "request.json"), spool_package)
             job_config = {
+                "spool_package": spool_package,
                 "submission_id": submission_id,
                 "job_name": job_name.strip() or NodeDefaults.JOB_NAME,
                 "priority": int(priority),
@@ -610,6 +737,9 @@ class DeadlineSubmitNode:
             if not success:
                 raise RuntimeError(result)
 
+            if spool_package:
+                _approved_path(os.path.join(package_dir, "ack.json"), [output_directory])
+                atomic_json(os.path.join(package_dir, "ack.json"), {"schemaVersion": 2, "submissionId": submission_id, "attemptId": spool_package["attemptId"], "fingerprint": spool_package["fingerprint"], "jobId": result})
             print(f"Deadline Submission: Submitted job {result} with {batch_count} variation(s), chunk size {chunk_size}, {len(assets)} staged asset(s).")
             return (result,)
         except Exception as exc:
@@ -707,14 +837,14 @@ class DeadlineSubmitNode:
         return None
 
     def _prepare_output_directory(self, output_directory: str) -> str:
-        output_directory = (output_directory or "").strip().strip("\"")
-        if not output_directory:
-            raise ValueError(
-                "Set DeadlineSubmit output_directory to a shared farm path, "
-                "e.g. \\\\server\\share\\output."
-            )
-
-        output_directory = os.path.abspath(os.path.expandvars(output_directory))
+        output_directory = (output_directory or "").strip()
+        if not output_directory or not os.path.isabs(output_directory):
+            raise ValueError("Set output_directory to a full farm-visible path, e.g. X:\\outputs\\shot010.")
+        _validate_path_text(output_directory)
+        import folder_paths
+        settings = DeadlineCommandHelper.get_farm_settings()
+        local_output = _farm_path(folder_paths.get_output_directory(), settings)
+        output_directory = _approved_path(_farm_path(output_directory, settings), [local_output] + settings["output_roots"])
         os.makedirs(output_directory, exist_ok=True)
         if not os.path.isdir(output_directory):
             raise ValueError(f"Output path is not a directory: {output_directory}")

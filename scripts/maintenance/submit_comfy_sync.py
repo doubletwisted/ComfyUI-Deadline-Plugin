@@ -178,6 +178,9 @@ def create_temp_file(lines, suffix):
 
 
 def build_job_info(args, job_name, comment):
+    for value in (job_name, comment, args.pool, args.group, args.region, args.allowlist, args.user_name):
+        if any(c in str(value) for c in "\r\n\x00"):
+            raise ValueError("Deadline job values cannot contain newlines or NUL characters")
     lines = [
         "Plugin=DeadlineCommand",
         "Name={0}".format(job_name),
@@ -200,11 +203,14 @@ def build_job_info(args, job_name, comment):
 
 
 def build_plugin_info(args, script_path):
-    argument_parts = ["-ExecuteScript", '"{0}"'.format(script_path)]
+    for value in (script_path, args.worker_deadline_command, args.additional_arguments):
+        if any(c in str(value) for c in "\r\n\x00"):
+            raise ValueError("Deadline plugin values cannot contain newlines or NUL characters")
+    if '"' in script_path:
+        raise ValueError("Script paths cannot contain quotes")
+    arguments = subprocess.list2cmdline(["-ExecuteScript", script_path])
     if args.additional_arguments:
-        argument_parts.append(args.additional_arguments)
-
-    arguments = " ".join(argument_parts)
+        arguments += " " + args.additional_arguments
     lines = [
         "Executable={0}".format(args.worker_deadline_command),
         "Arguments={0}".format(arguments),
