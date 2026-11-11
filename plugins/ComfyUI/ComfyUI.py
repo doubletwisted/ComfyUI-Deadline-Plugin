@@ -40,6 +40,9 @@ Supports both existing ComfyUI instances and launching new ones.
 DEFAULT_PORT = 8188
 PORT_OFFSET_PER_GPU = 100
 DEFAULT_POLLING_INTERVAL = 10  # seconds
+# Interpreter of ComfyUI portable, relative to an installation path. Used when
+# the "ComfyUI Python Executable" plugin setting is empty.
+EMBEDDED_PYTHON = os.path.join("python_embeded", "python.exe")
 MAX_SEED_VALUE = 2147483647
 PROGRESS_LOG_INTERVAL = 10  # Log every 10 polls
 FILE_WRITE_DELAY = 2  # seconds to wait for files to be written
@@ -296,9 +299,9 @@ class ComfyUI(DeadlinePlugin):
             if not candidate:
                 continue
 
-            python_exe = os.path.join(candidate, "python_embeded", "python.exe")
+            python_exe = self._python_executable_for(candidate)
             comfy_main = os.path.join(candidate, "ComfyUI", "main.py")
-            path_exists = os.path.exists(python_exe) and os.path.exists(comfy_main)
+            path_exists = os.path.isfile(python_exe) and os.path.exists(comfy_main)
 
             if path_exists:
                 self.comfyui_install_path = candidate
@@ -306,8 +309,8 @@ class ComfyUI(DeadlinePlugin):
                 return self.comfyui_install_path
 
             missing_items = []
-            if not os.path.exists(python_exe):
-                missing_items.append("python_embeded/python.exe")
+            if not os.path.isfile(python_exe):
+                missing_items.append(python_exe if self._configured_python_executable() else "python_embeded/python.exe")
             if not os.path.exists(comfy_main):
                 missing_items.append("ComfyUI/main.py")
             missing_desc = ", ".join(missing_items) if missing_items else "required files"
@@ -315,9 +318,41 @@ class ComfyUI(DeadlinePlugin):
 
         error_msg = "Unable to locate a valid ComfyUI installation from ComfyUIPath entries. "
         error_msg += f"Tried: {', '.join(resolved_candidates)}"
+        configured_python = self._configured_python_executable()
+        if configured_python:
+            error_msg += (
+                f". The 'ComfyUI Python Executable' setting is '{configured_python}', which resolved to "
+                f"{', '.join(dict.fromkeys(self._python_executable_for(candidate) for candidate in resolved_candidates))}; "
+                "it must name an existing Python executable (a relative path is resolved against each installation "
+                "path). Clear the setting to use python_embeded\\python.exe."
+            )
         self.LogWarning(error_msg)
         self.FailRender(error_msg)
         return ""
+
+    def _configured_python_executable(self) -> str:
+        """The 'ComfyUI Python Executable' plugin setting; empty means ComfyUI portable's embedded Python."""
+        return self.GetConfigEntryWithDefault("ComfyUIPythonExecutable", "").strip().strip('"').strip("'")
+
+    def _python_executable_for(self, install_path: str) -> str:
+        """Interpreter that runs ComfyUI for an installation path.
+
+        ComfyUI's own modules (comfy, folder_paths, custom_nodes) are imported
+        from the folder of ComfyUI/main.py whatever the interpreter, so only
+        ComfyUI's third-party requirements must be installed in it.
+        """
+        configured = self._configured_python_executable()
+        if not configured:
+            return os.path.join(install_path, EMBEDDED_PYTHON)
+        try:
+            mapped = RepositoryUtils.CheckPathMapping(configured)
+        except Exception as e:
+            self.LogWarning(f"Path mapping failed for '{configured}': {e}")
+            mapped = configured
+        expanded = os.path.expandvars(os.path.expanduser(mapped))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(install_path, expanded)
+        return os.path.normpath(expanded)
 
     def Cleanup(self):
         """Clean up plugin resources"""
@@ -705,7 +740,7 @@ class ComfyUI(DeadlinePlugin):
             ).strip()
             process_data = json.loads(process_json)
             expected_python = os.path.normcase(os.path.realpath(
-                os.path.join(self.comfyui_install_path, "python_embeded", "python.exe")
+                self._python_executable_for(self.comfyui_install_path)
             ))
             actual_python = os.path.normcase(os.path.realpath(process_data.get("ExecutablePath", "")))
             command_line = str(process_data.get("CommandLine", "")).lower().replace("\\", "/")
@@ -881,15 +916,21 @@ class ComfyUI(DeadlinePlugin):
         comfyui_path = self._resolve_comfyui_install_path()
         if not comfyui_path:
             return ""
-        python_exe = os.path.join(comfyui_path, "python_embeded", "python.exe")
-        
-        if os.path.exists(python_exe):
-            self.LogInfo(f"Using ComfyUI embedded Python: {python_exe}")
+        python_exe = self._python_executable_for(comfyui_path)
+        configured = bool(self._configured_python_executable())
+
+        if os.path.isfile(python_exe):
+            self.LogInfo(f"Using ComfyUI {'configured' if configured else 'embedded'} Python: {python_exe}")
             # Set the Deadline worker name as environment variable for ComfyUI process
             self._set_deadline_environment_variables()
             return python_exe
         else:
-            error_msg = f"ComfyUI embedded Python not found at: {python_exe}. Please check your ComfyUIPath entries."
+            if configured:
+                error_msg = (
+                    f"ComfyUI Python not found at: {python_exe}. Check the 'ComfyUI Python Executable' plugin setting."
+                )
+            else:
+                error_msg = f"ComfyUI embedded Python not found at: {python_exe}. Please check your ComfyUIPath entries."
             self.LogWarning(error_msg)
             self.FailRender(error_msg)
             return ""
