@@ -37,7 +37,7 @@ Type=multilinestring
 Label=Allowed Storage Locations (Optional)
 Category=Configuration
 Index=3
-Default=G:\*;X:\input\*;X:\outputs\*;X:\playground\*;Y:\*;\\NAS02\grajdolek\*;\\NAS02\Comfy\input\*;\\NAS02\Comfy\outputs\*;\\NAS02\Comfy\playground\*;\\NAS04\3d-02\*
+Default=
 Description=Approved input and output locations, one per line. Both drive-letter and UNC rules are supported. Mapped network paths are converted to UNC before submission and checked against the UNC rules. A folder also allows all its subfolders. Default Output Directory and local ComfyUI input/output folders are already allowed.
 
 [ComfyUIWorkerEndpoints]
@@ -46,4 +46,4 @@ Label=Per-Worker ComfyUI Endpoints
 Category=Configuration
 Index=2
 Default={}
-Description=Optional JSON keyed by worker name. Example: {"M28":{"ComfyUIApiUrl":"http://127.0.0.1:8188","LaunchGpuUuid":"GPU-..."}}. A verified endpoint is reused; fallback launches only at that port and resolves the UUID.
+Description=Optional JSON keyed by worker name. Example: {"RENDER01":{"ComfyUIApiUrl":"http://127.0.0.1:8188","LaunchGpuUuid":"GPU-..."}}. A verified endpoint is reused; fallback launches only at that port and resolves the UUID.

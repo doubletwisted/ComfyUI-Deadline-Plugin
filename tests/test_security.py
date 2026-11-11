@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import configparser
 import json
 import os
 import subprocess
@@ -188,35 +187,34 @@ class FarmSettingsTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows UNC share roots")
     def test_unc_share_root_remains_rooted_after_realpath(self):
         maintenance = load_script("ComfyModelsSync")
-        candidate = r"\\NAS02\grajdolek\project\image.png"
-        for root in ("\\\\NAS02\\grajdolek", "\\\\NAS02\\grajdolek\\"):
+        candidate = r"\\FILESERVER\projects\project\image.png"
+        for root in ("\\\\FILESERVER\\projects", "\\\\FILESERVER\\projects\\"):
             with self.subTest(root=root), patch.object(os.path, "realpath", side_effect=lambda path: path.rstrip("\\")):
                 self.assertEqual(deadline_submit._approved_path(candidate, [root]), candidate)
                 self.assertEqual(plugin_module.approved_path(candidate, [root]), candidate)
                 self.assertEqual(maintenance.checked_model_path(root, candidate), candidate)
                 with self.assertRaises(ValueError):
-                    deadline_submit._approved_path(r"\\NAS02\grajdolek-other\private.png", [root])
+                    deadline_submit._approved_path(r"\\FILESERVER\projects-other\private.png", [root])
 
-    def studio_policy(self):
-        config = configparser.RawConfigParser()
-        config.read(Path(__file__).resolve().parents[1] / "plugins" / "ComfyUI" / "ComfyUI.param")
-        policy = config["AllowedStorageRoots"]["Default"]
+    def example_policy(self):
+        policy = (r"G:\*;X:\input\*;X:\outputs\*;X:\playground\*;Y:\*;\\FILESERVER\projects\*;\\FILESERVER\comfy\input\*;"
+                  r"\\FILESERVER\comfy\outputs\*;\\FILESERVER\comfy\playground\*;\\ASSETS\library\*")
         module = load_script("read_farm_settings", directory="")
         settings = {"output_roots": module.storage_locations(policy), "input_roots": module.storage_locations(policy),
-                    "drive_mappings": {"G:": r"\\NAS02\grajdolek", "X:": r"\\NAS02\Comfy", "Y:": r"\\NAS04\3d-02"}}
+                    "drive_mappings": {"G:": r"\\FILESERVER\projects", "X:": r"\\FILESERVER\comfy", "Y:": r"\\ASSETS\library"}}
         return policy, settings
 
-    @unittest.skipUnless(os.name == "nt", "Windows studio storage policy")
-    def test_studio_defaults_allow_both_forms_and_restrict_x_subfolders(self):
-        policy, settings = self.studio_policy()
+    @unittest.skipUnless(os.name == "nt", "Windows storage policy")
+    def test_example_policy_allows_both_forms_and_restricts_x_subfolders(self):
+        policy, settings = self.example_policy()
         plugin = new_plugin(GetConfigEntryWithDefault=lambda key, default: policy if key == "AllowedStorageRoots" else default,
                             _resolve_comfyui_install_path=lambda: r"C:\Comfy")
         roots = plugin._storage_roots("output")
         allowed = [r"G:\project\render", r"Y:\project\render", r"X:\input\project", r"X:\outputs\project", r"X:\playground\project",
-                   r"\\NAS02\grajdolek\project\render", r"\\NAS04\3d-02\project\render", r"\\NAS02\Comfy\input\project",
-                   r"\\NAS02\Comfy\outputs\project", r"\\NAS02\Comfy\playground\project"]
-        denied = ["X:\\", r"X:\models\secret", r"X:\outputs-other\project", r"\\NAS02\Comfy\models\secret",
-                  r"\\NAS02\Comfy\outputs-other\project", r"\\unapproved.invalid\share\file", r"C:\private\secret"]
+                   r"\\FILESERVER\projects\project\render", r"\\ASSETS\library\project\render", r"\\FILESERVER\comfy\input\project",
+                   r"\\FILESERVER\comfy\outputs\project", r"\\FILESERVER\comfy\playground\project"]
+        denied = ["X:\\", r"X:\models\secret", r"X:\outputs-other\project", r"\\FILESERVER\comfy\models\secret",
+                  r"\\FILESERVER\comfy\outputs-other\project", r"\\unapproved.invalid\share\file", r"C:\private\secret"]
         with patch.object(os.path, "realpath", side_effect=lambda path: path):
             for path in allowed:
                 with self.subTest(path=path):
@@ -231,7 +229,7 @@ class FarmSettingsTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows mapped network paths")
     def test_submission_stores_unc_output_and_input_paths(self):
-        _, settings = self.studio_policy()
+        _, settings = self.example_policy()
         folders = types.SimpleNamespace(get_output_directory=lambda: r"C:\Comfy\output")
         captured = []
 
@@ -244,31 +242,31 @@ class FarmSettingsTests(unittest.TestCase):
                 patch.object(os.path, "realpath", side_effect=lambda path: path), \
                 patch.object(os.path, "isdir", return_value=True), \
                 patch.object(deadline_submit.os, "makedirs") as mkdir, \
-                patch.object(InputAssetStager, "stage_referenced_assets", return_value=(r"\\NAS02\Comfy\outputs\shot\.deadline-inputs\test", r"\\NAS02\Comfy\outputs\manifest.json", [])), \
+                patch.object(InputAssetStager, "stage_referenced_assets", return_value=(r"\\FILESERVER\comfy\outputs\shot\.deadline-inputs\test", r"\\FILESERVER\comfy\outputs\manifest.json", [])), \
                 patch.object(DeadlineJobSubmitter, "submit_job", submit):
             result = DeadlineSubmitNode().submit_to_deadline(r"X:\outputs\shot", 1, 1, 50, "none", "none", "Render",
                                                            prompt={"1": {"class_type": "SaveImage", "inputs": {}}})
         self.assertEqual(result, ("unc-test-job",))
-        self.assertEqual(captured[0]["output_directory"], r"\\NAS02\Comfy\outputs\shot")
-        self.assertTrue(captured[0]["input_directory"].startswith(r"\\NAS02\Comfy\outputs"))
-        mkdir.assert_called_once_with(r"\\NAS02\Comfy\outputs\shot", exist_ok=True)
+        self.assertEqual(captured[0]["output_directory"], r"\\FILESERVER\comfy\outputs\shot")
+        self.assertTrue(captured[0]["input_directory"].startswith(r"\\FILESERVER\comfy\outputs"))
+        mkdir.assert_called_once_with(r"\\FILESERVER\comfy\outputs\shot", exist_ok=True)
 
     @unittest.skipUnless(os.name == "nt", "Windows mapped network paths")
     def test_absolute_media_source_is_resolved_to_allowed_unc(self):
-        _, settings = self.studio_policy()
+        _, settings = self.example_policy()
         stager = InputAssetStager(r"X:\outputs\shot", "test", "test")
         with patch.object(DeadlineCommandHelper, "get_farm_settings", return_value=settings), \
                 patch.object(os.path, "realpath", side_effect=lambda path: path), \
                 patch.object(os.path, "isfile", return_value=True):
             result = stager._resolve_input_file(r"G:\project\source.png", r"C:\Comfy\input", True, True)
-        self.assertEqual(result, (r"G:\project\source.png", r"\\NAS02\grajdolek\project\source.png"))
+        self.assertEqual(result, (r"G:\project\source.png", r"\\FILESERVER\projects\project\source.png"))
 
     @unittest.skipUnless(os.name == "nt", "Windows mapped network paths")
     def test_mapped_rules_discover_their_unc_equivalents(self):
         module = load_script("read_farm_settings", directory="")
         config = {"AllowedStorageRoots": "G:\\*;X:\\input\\*;X:\\outputs\\*;X:\\playground\\*;Y:\\*"}
         plugin_config = types.SimpleNamespace(GetConfigEntryWithDefault=lambda key, default: config.get(key, default))
-        aliases = {"G:": r"\\NAS02\grajdolek", "X:": r"\\NAS02\Comfy", "Y:": r"\\NAS04\3d-02"}
+        aliases = {"G:": r"\\FILESERVER\projects", "X:": r"\\FILESERVER\comfy", "Y:": r"\\ASSETS\library"}
         with patch.object(module.RepositoryUtils, "GetPluginConfig", return_value=plugin_config, create=True), \
                 patch.object(module.PathUtils, "GetMappedDriveNetworkPath", side_effect=lambda drive: aliases.get(drive, "")) as mapping, \
                 patch("builtins.print") as printed:
@@ -276,8 +274,8 @@ class FarmSettingsTests(unittest.TestCase):
         settings = json.loads(printed.call_args.args[0].split("=", 1)[1])
         self.assertEqual(settings["drive_mappings"], aliases)
         self.assertEqual(mapping.call_count, 3)
-        self.assertIn("\\\\NAS02\\Comfy\\input\\", settings["output_roots"])
-        self.assertNotIn("\\\\NAS02\\Comfy\\", settings["output_roots"])
+        self.assertIn("\\\\FILESERVER\\comfy\\input\\", settings["output_roots"])
+        self.assertNotIn("\\\\FILESERVER\\comfy\\", settings["output_roots"])
 
     def test_allowed_full_output_path_is_preserved(self):
         with tempfile.TemporaryDirectory() as temp:

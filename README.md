@@ -83,7 +83,7 @@ G:\*
 
 `X:\*` allows the whole X drive; `X:\projects\*` limits access to that folder and all its subfolders. Plain absolute folder paths also work. Only a final `\*` is supported; patterns such as `X:\project*\renders` are rejected.
 
-The studio defaults allow all of G: and Y:, plus only `X:\input`, `X:\outputs`, and `X:\playground`. Equivalent UNC rules are included: `\\NAS02\grajdolek`, `\\NAS04\3d-02`, and the three matching folders beneath `\\NAS02\Comfy`. Other folders on X: remain blocked.
+The list is empty by default, so jobs can only use the Default Output Directory and the local ComfyUI input/output folders until you add locations. To open part of a drive, list only those folders, for example `X:\input\*` and `X:\outputs\*`; other folders on X: stay blocked. For a mapped drive, also add the matching UNC rule, such as `\\fileserver\comfy\outputs\*`.
 
 Both mapped and UNC paths can be entered. On submission, mapped network paths are converted to their current UNC locations, validated, and stored in the job as UNC paths. UNC inputs work directly, so workers do not need matching drive letters for this plugin's staged inputs and outputs. Existing local drive paths remain local. If another node keeps an unstaged drive-letter path, that node still needs the drive mapped on its workers. Deadline services can have different drive mappings from interactive users; see [Deadline's mapped-drive documentation](https://docs.thinkboxsoftware.com/products/deadline/10.4/1_User%20Manual/manual/repository-config.html#mapped-drives).
 
