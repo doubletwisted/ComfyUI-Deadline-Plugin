@@ -714,6 +714,17 @@ class ComfyUI(DeadlinePlugin):
         """Verify a legacy endpoint by the OS port owner and exact install Python."""
         if platform.system().lower() != "windows":
             return {}
+        if self._configured_python_executable():
+            # The port owner's interpreter only identifies the installation when
+            # it is that installation's own python_embeded. A venv's python.exe
+            # runs the base interpreter as a child, and an absolute interpreter
+            # can be shared by several checkouts, so require /deadline/session.
+            self.LogInfo(
+                "Not reusing a ComfyUI endpoint without /deadline/session while "
+                "'ComfyUI Python Executable' is set. Update ComfyUI-Deadline-Plugin "
+                "in that ComfyUI so its endpoint reports which installation it runs."
+            )
+            return {}
         try:
             netstat = subprocess.check_output(
                 ["netstat", "-ano", "-p", "tcp"],

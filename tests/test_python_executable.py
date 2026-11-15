@@ -109,26 +109,64 @@ class PythonExecutableTests(unittest.TestCase):
         self.assertIn(os.path.normpath(str(main_py)), arguments)
         self.assertEqual(failures, [])
 
-    def test_legacy_endpoint_owner_must_run_the_configured_python(self):
+    def _legacy_identity(self, plugin, executable, main_py):
+        netstat = "  TCP    127.0.0.1:8188         0.0.0.0:0              LISTENING       4242\n"
+        process = json.dumps({
+            "ProcessId": 4242,
+            "ExecutablePath": str(executable),
+            "CommandLine": f'"{executable}" -s "{main_py}" --port 8188',
+        })
+        with patch.object(plugin_module.platform, "system", return_value="Windows"), \
+                patch.object(plugin_module.subprocess, "check_output", side_effect=[netstat, process]) as calls:
+            identity = plugin._local_port_process_identity(8188)
+        return identity, calls
+
+    def test_legacy_endpoint_check_still_accepts_the_portable_embedded_python(self):
+        install = self.root / "ComfyUI_windows_portable"
+        main_py = _touch(install / "ComfyUI" / "main.py")
+        embedded = _touch(install / "python_embeded" / "python.exe")
+        plugin, _ = self._plugin()
+        plugin.comfyui_install_path = str(install)
+
+        identity, _ = self._legacy_identity(plugin, embedded, main_py)
+
+        self.assertEqual(identity.get("pid"), 4242)
+
+    def test_legacy_endpoint_is_never_trusted_with_a_configured_python(self):
+        # The port owner's interpreter cannot identify the installation: a venv
+        # runs the base Python as a child, and a shared absolute interpreter can
+        # serve another checkout. Only /deadline/session may prove ownership.
+        install_a = self.root / "A"
+        _touch(install_a / "ComfyUI" / "main.py")
+        other_main = _touch(self.root / "B" / "ComfyUI" / "main.py")
+        shared_python = _touch(self.root / "envs" / "comfy" / "python.exe")
+        plugin, _ = self._plugin(ComfyUIPythonExecutable=str(shared_python))
+        plugin.comfyui_install_path = str(install_a)
+
+        identity, calls = self._legacy_identity(plugin, shared_python, other_main)
+
+        self.assertEqual(identity, {})
+        calls.assert_not_called()
+
+    def test_endpoint_reporting_its_installation_is_reused_with_a_configured_python(self):
         packages = self.root / "Packages"
         _touch(packages / "ComfyUI" / "main.py")
-        venv_python = _touch(packages / "ComfyUI" / "venv" / "Scripts" / "python.exe")
+        _touch(packages / "ComfyUI" / "venv" / "Scripts" / "python.exe")
         plugin, _ = self._plugin(
             ComfyUIPythonExecutable=os.path.join("ComfyUI", "venv", "Scripts", "python.exe"),
         )
         plugin.comfyui_install_path = str(packages)
-        netstat = "  TCP    127.0.0.1:8188         0.0.0.0:0              LISTENING       4242\n"
-        process = json.dumps({
-            "ProcessId": 4242,
-            "ExecutablePath": str(venv_python),
-            "CommandLine": f'"{venv_python}" -s "{packages / "ComfyUI" / "main.py"}" --port 8188',
+        plugin.http_request = lambda url, **kwargs: ({
+            "status_code": 200,
+            "json": lambda: {"product": "ComfyUI-Deadline-Plugin", "protocol": 1,
+                              "session_id": "venv-gui", "pid": 77,
+                              "comfyui_root": str(packages / "ComfyUI")},
+        } if url.endswith("/deadline/session") else {
+            "status_code": 200, "json": lambda: {"devices": [{}], "system": {"argv": []}},
         })
 
-        with patch.object(plugin_module.platform, "system", return_value="Windows"), \
-                patch.object(plugin_module.subprocess, "check_output", side_effect=[netstat, process]):
-            identity = plugin._local_port_process_identity(8188)
-
-        self.assertEqual(identity.get("pid"), 4242)
+        self.assertTrue(plugin._verified_comfy_endpoint("http://127.0.0.1:8188"))
+        self.assertEqual(plugin.endpoint_session_id, "venv-gui")
 
 
 if __name__ == "__main__":
