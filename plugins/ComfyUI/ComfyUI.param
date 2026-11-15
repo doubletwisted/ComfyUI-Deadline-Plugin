@@ -22,7 +22,15 @@ Label=ComfyUI Installation Paths
 Category=Configuration
 Index=0
 Default=C:\\ComfyUI_windows_portable
-Description=One path per line (local drive letters, UNC paths, etc). Workers try each entry in order and pick the first install that contains ComfyUI\\main.py and python_embeded\\python.exe.
+Description=One path per line (local drive letters, UNC paths, etc). Workers try each entry in order and pick the first install that contains ComfyUI\\main.py and its Python executable (python_embeded\\python.exe unless ComfyUI Python Executable is set).
+
+[ComfyUIPythonExecutable]
+Type=filename
+Label=ComfyUI Python Executable (Optional)
+Category=Configuration
+Index=4
+Default=
+Description=Python that runs ComfyUI. Leave empty for ComfyUI portable (python_embeded\\python.exe in the installation path). A relative path is resolved against each installation path, for example ComfyUI\\venv\\Scripts\\python.exe; an absolute path is used as is. That Python must have ComfyUI's requirements installed.
 
 [DefaultOutputDirectory]
 Type=filename

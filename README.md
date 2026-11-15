@@ -52,9 +52,30 @@ D:\Apps\ComfyUI
 
 Workers try those paths in order and use the first one that contains `ComfyUI\main.py` and `python_embeded\python.exe`.
 
+### Other ComfyUI installs (Stability Matrix, venv, conda)
+
+If ComfyUI does not run from the portable build's `python_embeded`, set **ComfyUI Python Executable** in the same
+plugin settings. Leave it empty to keep using `python_embeded\python.exe`. A relative path is resolved against each
+installation path; an absolute path is used as is. Workers still run `<installation path>\ComfyUI\main.py`, so
+ComfyUI's own modules load from that folder, and the configured Python only needs ComfyUI's requirements (torch and
+so on) installed.
+
+For Stability Matrix, where ComfyUI lives in `Data\Packages\ComfyUI` with its own `venv`:
+
+```text
+ComfyUI Installation Paths:  C:\StabilityMatrix\Data\Packages
+ComfyUI Python Executable:   ComfyUI\venv\Scripts\python.exe
+```
+
+The portable build's `python_embeded` ignores `PYTHONPATH` (its `._pth` file puts it in isolated mode), so pointing
+it at another install's packages does not work; configure that install's own Python instead. A configured Python
+does honour the worker's `PYTHONPATH`.
+
+Before upgrading, check that **ComfyUI Python Executable** is empty unless you mean to set it. Once the setting exists, every job uses whatever value it holds, and a wrong path fails the task instead of falling back to `python_embeded`.
+
 ## Reusing a worker's GUI session
 
-Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts on the configured port and resolves the configured NVIDIA UUID. An occupied, unverified endpoint fails the task. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
+Set these Deadline worker extra-info keys for each ComfyUI worker: `ComfyUIApiUrl` (for example `http://127.0.0.1:8188`) and `ComfyUILaunchGpuUuid` (an NVIDIA `GPU-...` UUID). The configured local endpoint is verified before a job queues its own prompt behind existing GUI work. Verification prefers the plugin's `/deadline/session` identity response and matching ComfyUI root; for an older already-running session, Windows port ownership, executable path, PID, and command line must match the configured installation. That older-session check needs the portable `python_embeded`; with **ComfyUI Python Executable** set, only a session that answers `/deadline/session` (this plugin version or later in that ComfyUI) is reused. An unrelated service that happens to own the port is never reused. Deadline tracks only that prompt and never stops the GUI backend. If the endpoint is absent, fallback starts on the configured port and resolves the configured NVIDIA UUID. An occupied, unverified endpoint fails the task. The older `Per-Worker ComfyUI Endpoints` JSON setting remains a fallback for existing configurations.
 
 For a verified reused endpoint, task inputs are copied into an isolated `input/deadline/<submission-id>` subtree and recorded outputs are copied to the job output directory.
 
